@@ -990,6 +990,6 @@ int main(int argc, char *argv[])
 
 	switch (testcase) {
 	case IOP_HTTP3:
-		return do_http3_server(pkeyfile, certfile, argv[0]);
+		return do_http3_server(argv[0], pkeyfile, certfile);
 	}
 }
