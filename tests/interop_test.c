@@ -5,11 +5,57 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 
 static int http_log_level = LOG_INFO;
+
+/*
+ * https://github.com/quic-interop/quic-interop-runner/
+ * https://github.com/quic-go/quic-go/blob/master/interop/client/main.go
+ * https://github.com/quic-go/quic-go/blob/master/interop/server/main.go
+ */
+#define IOP_CHACHA20		1
+#define IOP_HANDSHAKE		2
+#define IOP_HTTP3		3
+#define IOP_KEYUPDATE		4
+#define IOP_MULTICONNECT	5
+#define IOP_RESUMPTION		6
+#define IOP_RETRY		7
+#define IOP_TRANSFER		8
+#define IOP_VERSIONNEGOTIATION	9
+#define IOP_ZERORTT		10
+
+static int iop_get_testcase(void)
+{
+	char *testcase = getenv("TESTCASE");
+	if (!testcase) {
+		return 0;
+	} else if(!strcmp(testcase, "chacha20")) {
+		return IOP_CHACHA20;
+	} else if(!strcmp(testcase, "handshake")) {
+		return IOP_HANDSHAKE;
+	} else if(!strcmp(testcase, "http3")) {
+		return IOP_HTTP3;
+	} else if(!strcmp(testcase, "keyupdate")) {
+		return IOP_KEYUPDATE;
+	} else if(!strcmp(testcase, "multiconnect")) {
+		return IOP_MULTICONNECT;
+	} else if(!strcmp(testcase, "resumption")) {
+		return IOP_RESUMPTION;
+	} else if(!strcmp(testcase, "retry")) {
+		return IOP_RETRY;
+	} else if(!strcmp(testcase, "transfer")) {
+		return IOP_TRANSFER;
+	} else if (!strcmp(testcase, "versionnegotiation")) {
+		return IOP_VERSIONNEGOTIATION;
+	} else if(!strcmp(testcase, "zerortt")) {
+		return IOP_ZERORTT;
+	}
+	return 0;
+}
 
 static void http_log_debug(char const *fmt, ...)
 {
@@ -892,7 +938,7 @@ free:
 static void usage(void)
 {
 	fprintf(stderr,
-"usage: interop_test -c -T testcase url\n"
+"usage: interop_test -c url\n"
 "       interop_test -s -C certfile -P pkeyfile address:port\n"
 	);
 	exit(255);
@@ -900,19 +946,16 @@ static void usage(void)
 
 int main(int argc, char *argv[])
 {
-	int ch, server = 0, client = 0;
-	char *certfile = NULL, *pkeyfile = NULL, *testcase = NULL;
+	int ch, server = 0, client = 0, testcase = 0;
+	char *certfile = NULL, *pkeyfile = NULL;
 
-	while ((ch = getopt(argc, argv, "C:P:T:cs")) != -1) {
+	while ((ch = getopt(argc, argv, "C:P:cs")) != -1) {
 		switch (ch) {
 		case 'C':
 			certfile = optarg;
 			break;
 		case 'P':
 			pkeyfile = optarg;
-			break;
-		case 'T':
-			testcase = optarg;
 			break;
 		case 'c':
 			client = 1;
@@ -927,9 +970,15 @@ int main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
-	if (argc != 1 || (!client && !server) ||
-	    (client && (certfile || pkeyfile || !testcase)) || 
-	    (server && (!certfile || !pkeyfile || testcase)))
+	testcase = iop_get_testcase();
+	if (!testcase || (server && testcase == IOP_KEYUPDATE)) {
+		fprintf(stderr, "unknown test case\n");
+		return 1;
+	}
+
+	if (argc != 1 || (!client && !server) || !testcase ||
+	    (client && (certfile || pkeyfile)) ||
+	    (server && (!certfile || !pkeyfile)))
 		usage();
 
 	if (client)
