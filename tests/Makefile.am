@@ -15,6 +15,9 @@ ticket_test_SOURCE	= ticket_test.c
 http3_test: http3_test.c
 	$(LIBTOOL) --mode=link $(CC) $^  -o $@ -lnghttp3 \
 		$(LDADD) $(AM_CPPFLAGS) $(AM_CFLAGS)
+interop_test: interop_test.c
+	$(LIBTOOL) --mode=link $(CC) $^  -o $@ -lnghttp3 \
+		$(LDADD) $(AM_CPPFLAGS) $(AM_CFLAGS)
 msquic_test: msquic_test.c
 	$(CXX) $^ -o $@ -lmsquic -Wl,-rpath=/usr/local/lib -Wall
 
