@@ -116,57 +116,35 @@ struct http_request {
 	int64_t		stream_id;
 };
 
-static int http_acked_stream_data(nghttp3_conn *conn, int64_t stream_id, uint64_t datalen,
+static int http3_acked_stream_data(nghttp3_conn *conn, int64_t stream_id, uint64_t datalen,
+				   void *user_data, void *stream_user_data)
+{
+	http_log_debug("%s\n", __func__);
+	return 0;
+}
+
+static int http3_stream_close(nghttp3_conn *conn, int64_t stream_id, uint64_t app_error_code,
+			      void *conn_user_data, void *stream_user_data)
+{
+	http_log_debug("%s\n", __func__);
+	return 0;
+}
+
+static int http3_deferred_consume(nghttp3_conn *conn, int64_t stream_id, size_t nconsumed,
 				  void *user_data, void *stream_user_data)
 {
 	http_log_debug("%s\n", __func__);
 	return 0;
 }
 
-static int http_stream_close(nghttp3_conn *conn, int64_t stream_id, uint64_t app_error_code,
-			     void *conn_user_data, void *stream_user_data)
-{
-	http_log_debug("%s\n", __func__);
-	return 0;
-}
-
-static int http_deferred_consume(nghttp3_conn *conn, int64_t stream_id, size_t nconsumed,
-				 void *user_data, void *stream_user_data)
-{
-	http_log_debug("%s\n", __func__);
-	return 0;
-}
-
-static int http_begin_headers(nghttp3_conn *conn, int64_t stream_id, void *user_data,
-			      void *stream_user_data)
-{
-	http_log_debug("%s\n", __func__);
-	return 0;
-}
-
-static int http_recv_header(nghttp3_conn *conn, int64_t stream_id, int32_t token,
-			    nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
-			    void *user_data, void *stream_user_data)
-{
-	http_log_debug("%s\n", __func__);
-	return 0;
-}
-
-static int http_end_headers(nghttp3_conn *conn, int64_t stream_id, int fin, void *user_data,
-			    void *stream_user_data)
-{
-	http_log_debug("%s\n", __func__);
-	return 0;
-}
-
-static int http_begin_trailers(nghttp3_conn *conn, int64_t stream_id, void *user_data,
+static int http3_begin_headers(nghttp3_conn *conn, int64_t stream_id, void *user_data,
 			       void *stream_user_data)
 {
 	http_log_debug("%s\n", __func__);
 	return 0;
 }
 
-static int http_recv_trailer(nghttp3_conn *conn, int64_t stream_id, int32_t token,
+static int http3_recv_header(nghttp3_conn *conn, int64_t stream_id, int32_t token,
 			     nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
 			     void *user_data, void *stream_user_data)
 {
@@ -174,42 +152,64 @@ static int http_recv_trailer(nghttp3_conn *conn, int64_t stream_id, int32_t toke
 	return 0;
 }
 
-static int http_end_trailers(nghttp3_conn *conn, int64_t stream_id, int fin,
-			     void *user_data, void *stream_user_data)
+static int http3_end_headers(nghttp3_conn *conn, int64_t stream_id, int fin, void *user_data,
+			     void *stream_user_data)
 {
 	http_log_debug("%s\n", __func__);
 	return 0;
 }
 
-static int http_stop_sending(nghttp3_conn *conn, int64_t stream_id, uint64_t app_error_code,
-			     void *user_data, void *stream_user_data)
+static int http3_begin_trailers(nghttp3_conn *conn, int64_t stream_id, void *user_data,
+			        void *stream_user_data)
 {
 	http_log_debug("%s\n", __func__);
 	return 0;
 }
 
-static int http_reset_stream(nghttp3_conn *conn, int64_t stream_id, uint64_t app_error_code,
-			     void *user_data, void *stream_user_data)
+static int http3_recv_trailer(nghttp3_conn *conn, int64_t stream_id, int32_t token,
+			      nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
+			      void *user_data, void *stream_user_data)
 {
 	http_log_debug("%s\n", __func__);
 	return 0;
 }
 
-static int http_recv_settings(nghttp3_conn *conn, const nghttp3_settings *settings,
-			      void *conn_user_data)
+static int http3_end_trailers(nghttp3_conn *conn, int64_t stream_id, int fin,
+			      void *user_data, void *stream_user_data)
 {
 	http_log_debug("%s\n", __func__);
 	return 0;
 }
 
-static int http_shutdown(nghttp3_conn *conn, int64_t id, void *conn_user_data)
+static int http3_stop_sending(nghttp3_conn *conn, int64_t stream_id, uint64_t app_error_code,
+			      void *user_data, void *stream_user_data)
 {
 	http_log_debug("%s\n", __func__);
 	return 0;
 }
 
-static int http_recv_data(nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
-			  size_t datalen, void *user_data, void *stream_user_data)
+static int http3_reset_stream(nghttp3_conn *conn, int64_t stream_id, uint64_t app_error_code,
+			      void *user_data, void *stream_user_data)
+{
+	http_log_debug("%s\n", __func__);
+	return 0;
+}
+
+static int http3_recv_settings(nghttp3_conn *conn, const nghttp3_settings *settings,
+			       void *conn_user_data)
+{
+	http_log_debug("%s\n", __func__);
+	return 0;
+}
+
+static int http3_shutdown(nghttp3_conn *conn, int64_t id, void *conn_user_data)
+{
+	http_log_debug("%s\n", __func__);
+	return 0;
+}
+
+static int http3_recv_data(nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
+			   size_t datalen, void *user_data, void *stream_user_data)
 {
 	static size_t total;
 	int i;
@@ -223,8 +223,8 @@ static int http_recv_data(nghttp3_conn *conn, int64_t stream_id, const uint8_t *
 	return 0;
 }
 
-static int http_client_end_stream(nghttp3_conn *conn, int64_t stream_id, void *user_data,
-				  void *stream_user_data)
+static int http3_client_end_stream(nghttp3_conn *conn, int64_t stream_id, void *user_data,
+				   void *stream_user_data)
 {
 	struct http_request *req = user_data;
 
@@ -239,7 +239,7 @@ static int http_parse_url(const char *url, struct http_request *req)
 
 	req->done = 0;
 	strcpy(req->method, "GET");
-	strcpy(req->user_agent, "nghttp3/quic client");
+	strcpy(req->user_agent, "nghttp3/quic client"); /* XXX */
 	if (!strncmp(url, "https://", 8)) {
 		strcpy(req->scheme, "https");
 		url += 8;
@@ -278,7 +278,7 @@ static int http_parse_url(const char *url, struct http_request *req)
 	return 0;
 }
 
-static int http_client_setup_socket(char *host, char *port)
+static int http3_client_setup_socket(char *host, char *port)
 {
 	struct quic_transport_param param = {};
 	struct addrinfo *rp, *res;
@@ -331,26 +331,26 @@ err_free:
 	return -1;
 }
 
-static int http_client_create_conn(nghttp3_conn **httpconn, int sockfd, struct http_request *req)
+static int http3_client_create_conn(nghttp3_conn **httpconn, int sockfd, struct http_request *req)
 {
 	int64_t ctrl_stream_id, qpack_enc_stream_id, qpack_dec_stream_id;
 	const nghttp3_mem *mem = nghttp3_mem_default();
 	nghttp3_callbacks callbacks = {
-		http_acked_stream_data,
-		http_stream_close,
-		http_recv_data,
-		http_deferred_consume,
-		http_begin_headers,
-		http_recv_header,
-		http_end_headers,
-		http_begin_trailers,
-		http_recv_trailer,
-		http_end_trailers,
-		http_stop_sending,
-		http_client_end_stream,
-		http_reset_stream,
-		http_shutdown,
-		http_recv_settings,
+		http3_acked_stream_data,
+		http3_stream_close,
+		http3_recv_data,
+		http3_deferred_consume,
+		http3_begin_headers,
+		http3_recv_header,
+		http3_end_headers,
+		http3_begin_trailers,
+		http3_recv_trailer,
+		http3_end_trailers,
+		http3_stop_sending,
+		http3_client_end_stream,
+		http3_reset_stream,
+		http3_shutdown,
+		http3_recv_settings,
 	};
 	struct quic_stream_info sinfo;
 	socklen_t len = sizeof(sinfo);
@@ -405,7 +405,7 @@ static int http_client_create_conn(nghttp3_conn **httpconn, int sockfd, struct h
 	return 0;
 }
 
-static int http_write_data(nghttp3_conn *httpconn, int sockfd)
+static int http3_write_data(nghttp3_conn *httpconn, int sockfd)
 {
 	int ret, i, flags = 0, fin = 0, sent;
 	int64_t stream_id = -1;
@@ -433,7 +433,7 @@ static int http_write_data(nghttp3_conn *httpconn, int sockfd)
 	return 0;
 }
 
-static int http_read_data(nghttp3_conn *httpconn, int sockfd)
+static int http3_read_data(nghttp3_conn *httpconn, int sockfd)
 {
 	int64_t stream_id = -1;
 	uint32_t flags = 0;
@@ -457,7 +457,7 @@ static int http_read_data(nghttp3_conn *httpconn, int sockfd)
 	return 0;
 }
 
-static void http_make_nv(nghttp3_nv *nv, char *name, char *value)
+static void http3_make_nv(nghttp3_nv *nv, char *name, char *value)
 {
 	nv->name = (uint8_t *)name;
 	nv->value = (uint8_t *)value;
@@ -466,7 +466,7 @@ static void http_make_nv(nghttp3_nv *nv, char *name, char *value)
 	nv->flags = NGHTTP3_NV_FLAG_NONE;
 }
 
-static int http_submit_request(nghttp3_conn *httpconn, int sockfd, struct http_request *req)
+static int http3_submit_request(nghttp3_conn *httpconn, int sockfd, struct http_request *req)
 {
 	struct quic_stream_info sinfo;
 	socklen_t len = sizeof(sinfo);
@@ -481,11 +481,11 @@ static int http_submit_request(nghttp3_conn *httpconn, int sockfd, struct http_r
 		return -1;
 	}
 
-	http_make_nv(&nva[0], ":method", req->method);
-	http_make_nv(&nva[1], ":scheme", req->scheme);
-	http_make_nv(&nva[2], ":authority", req->host);
-	http_make_nv(&nva[3], ":path", req->path);
-	http_make_nv(&nva[4], "user-agent", req->user_agent);
+	http3_make_nv(&nva[0], ":method", req->method);
+	http3_make_nv(&nva[1], ":scheme", req->scheme);
+	http3_make_nv(&nva[2], ":authority", req->host);
+	http3_make_nv(&nva[3], ":path", req->path);
+	http3_make_nv(&nva[4], "user-agent", req->user_agent);
 
 	for (i = 0; i < 5; i++)
 		http_log_debug("%s: %s -> %s\n", __func__, nva[i].name, nva[i].value);
@@ -494,10 +494,10 @@ static int http_submit_request(nghttp3_conn *httpconn, int sockfd, struct http_r
 	if (ret)
 		return -1;
 
-	return http_write_data(httpconn, sockfd);
+	return http3_write_data(httpconn, sockfd);
 }
 
-static int http_run_loop(nghttp3_conn *httpconn, int sockfd, struct http_request *req)
+static int http3_run_loop(nghttp3_conn *httpconn, int sockfd, struct http_request *req)
 {
 	struct timeval tv;
 	fd_set readfds;
@@ -512,23 +512,23 @@ static int http_run_loop(nghttp3_conn *httpconn, int sockfd, struct http_request
 		ret = select(sockfd + 1, &readfds, NULL,  NULL, &tv);
 		if (ret < 0)
 			return -1;
-		ret = http_read_data(httpconn, sockfd);
+		ret = http3_read_data(httpconn, sockfd);
 		if (ret < 0)
 			return -1;
-		ret = http_write_data(httpconn, sockfd);
+		ret = http3_write_data(httpconn, sockfd);
 		if (ret < 0)
 			return -1;
 	}
 	return 0;
 }
 
-static void http_conn_free(nghttp3_conn *httpconn, int sockfd)
+static void http3_conn_free(nghttp3_conn *httpconn, int sockfd)
 {
 	close(sockfd);
 	nghttp3_conn_del(httpconn);
 }
 
-static int do_client(const char *url)
+static int do_http3_client(const char *url)
 {
 	nghttp3_conn *httpconn = NULL;
 	struct http_request req;
@@ -538,26 +538,26 @@ static int do_client(const char *url)
 	if (ret)
 		return -1;
 
-	sockfd = http_client_setup_socket(req.host, req.port);
+	sockfd = http3_client_setup_socket(req.host, req.port);
 	if (sockfd < 0)
 		return -1;
 
-	ret = http_client_create_conn(&httpconn, sockfd, &req);
+	ret = http3_client_create_conn(&httpconn, sockfd, &req);
 	if (ret)
 		goto out;
 
-	ret = http_submit_request(httpconn, sockfd, &req);
+	ret = http3_submit_request(httpconn, sockfd, &req);
 	if (ret)
 		goto out;
 
-	ret = http_run_loop(httpconn, sockfd, &req);
+	ret = http3_run_loop(httpconn, sockfd, &req);
 
 out:
-	http_conn_free(httpconn, sockfd);
+	http3_conn_free(httpconn, sockfd);
 	return ret;
 }
 
-static int http_server_setup_socket(char *host, char *port)
+static int http3_server_setup_socket(char *host, char *port)
 {
 	struct quic_transport_param param = {};
 	struct addrinfo *rp, *res;
@@ -675,7 +675,7 @@ err:
 	return ret;
 }
 
-static int http_server_accept_socket(int listenfd, const char *pkey_file, const char *cert_file)
+static int http3_server_accept_socket(int listenfd, const char *pkey_file, const char *cert_file)
 {
 	char *alpn = "h3, h3-29";
 	unsigned int keylen;
@@ -701,8 +701,8 @@ static int http_server_accept_socket(int listenfd, const char *pkey_file, const 
 	return sockfd;
 }
 
-static int http_server_begin_headers(nghttp3_conn *conn, int64_t stream_id, void *user_data,
-				     void *stream_user_data)
+static int http3_server_begin_headers(nghttp3_conn *conn, int64_t stream_id, void *user_data,
+				      void *stream_user_data)
 {
 	struct http_request *req = user_data;
 
@@ -711,9 +711,9 @@ static int http_server_begin_headers(nghttp3_conn *conn, int64_t stream_id, void
 	return 0;
 }
 
-static int http_server_recv_header(nghttp3_conn *conn, int64_t stream_id, int32_t token,
-				   nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
-				   void *user_data, void *stream_user_data)
+static int http3_server_recv_header(nghttp3_conn *conn, int64_t stream_id, int32_t token,
+				    nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
+				    void *user_data, void *stream_user_data)
 {
 	nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
 	struct http_request *req = user_data;
@@ -740,9 +740,9 @@ static int http_server_recv_header(nghttp3_conn *conn, int64_t stream_id, int32_
 	return 0;
 }
 
-static nghttp3_ssize http_content_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec,
-				       size_t veccnt, uint32_t *pflags, void *user_data,
-				       void *stream_user_data)
+static nghttp3_ssize http3_content_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec,
+				        size_t veccnt, uint32_t *pflags, void *user_data,
+				        void *stream_user_data)
 {
 	struct http_request *req = user_data;
 
@@ -753,8 +753,8 @@ static nghttp3_ssize http_content_data(nghttp3_conn *conn, int64_t stream_id, ng
 	return 1;
 }
 
-static int http_server_end_stream(nghttp3_conn *conn, int64_t stream_id, void *user_data,
-				  void *stream_user_data)
+static int http3_server_end_stream(nghttp3_conn *conn, int64_t stream_id, void *user_data,
+				   void *stream_user_data)
 {
 	struct http_request *req = user_data;
 	char len[10], status[] = "200";
@@ -803,12 +803,12 @@ send:
 	if (ret < 0)
 		goto err;
 
-	http_make_nv(&nva[0], ":status", status);
-	http_make_nv(&nva[1], "server", "nghttp3/quic server");
-	http_make_nv(&nva[2], "content-type", "text/plain");
-	http_make_nv(&nva[3], "content-length", len);
+	http3_make_nv(&nva[0], ":status", status);
+	http3_make_nv(&nva[1], "server", "nghttp3/quic server");
+	http3_make_nv(&nva[2], "content-type", "text/plain");
+	http3_make_nv(&nva[3], "content-length", len);
 
-	dr.read_data = http_content_data;
+	dr.read_data = http3_content_data;
 	return nghttp3_conn_submit_response(conn, stream_id, nva, 4, &dr);
 err:
 	free(req->data);
@@ -816,27 +816,27 @@ err:
 	return -1;
 }
 
-static int http_server_create_conn(nghttp3_conn **httpconn, int sockfd, struct http_request *req)
+static int http3_server_create_conn(nghttp3_conn **httpconn, int sockfd, struct http_request *req)
 {
 	int64_t ctrl_stream_id, qpack_enc_stream_id, qpack_dec_stream_id;
 	const nghttp3_mem *mem = nghttp3_mem_default();
 	struct quic_transport_param param = {};
 	nghttp3_callbacks callbacks = {
-		http_acked_stream_data,
-		http_stream_close,
-		http_recv_data,
-		http_deferred_consume,
-		http_server_begin_headers,
-		http_server_recv_header,
-		http_end_headers,
-		http_begin_trailers,
-		http_recv_trailer,
-		http_end_trailers,
-		http_stop_sending,
-		http_server_end_stream,
-		http_reset_stream,
-		http_shutdown,
-		http_recv_settings,
+		http3_acked_stream_data,
+		http3_stream_close,
+		http3_recv_data,
+		http3_deferred_consume,
+		http3_server_begin_headers,
+		http3_server_recv_header,
+		http3_end_headers,
+		http3_begin_trailers,
+		http3_recv_trailer,
+		http3_end_trailers,
+		http3_stop_sending,
+		http3_server_end_stream,
+		http3_reset_stream,
+		http3_shutdown,
+		http3_recv_settings,
 	};
 	struct quic_stream_info sinfo;
 	socklen_t len = sizeof(sinfo);
@@ -901,7 +901,7 @@ static int http_server_create_conn(nghttp3_conn **httpconn, int sockfd, struct h
 	return 0;
 }
 
-static int do_server(char *host, const char *pkey_file, const char *cert_file)
+static int do_http3_server(char *host, const char *pkey_file, const char *cert_file)
 {
 	nghttp3_conn *httpconn = NULL;
 	int ret, listenfd, sockfd;
@@ -912,23 +912,23 @@ static int do_server(char *host, const char *pkey_file, const char *cert_file)
 	if (!host || !port)
 		return -1;
 
-	listenfd = http_server_setup_socket(host, port);
+	listenfd = http3_server_setup_socket(host, port);
 	if (listenfd < 0)
 		return -1;
 
 	while (1) {
-		sockfd = http_server_accept_socket(listenfd, pkey_file, cert_file);
+		sockfd = http3_server_accept_socket(listenfd, pkey_file, cert_file);
 		if (sockfd < 0)
 			break;
 
-		ret = http_server_create_conn(&httpconn, sockfd, &req);
+		ret = http3_server_create_conn(&httpconn, sockfd, &req);
 		if (ret)
 			goto free;
 
-		http_run_loop(httpconn, sockfd, &req);
+		http3_run_loop(httpconn, sockfd, &req);
 
 free:
-		http_conn_free(httpconn, sockfd);
+		http3_conn_free(httpconn, sockfd);
 	}
 
 	close(listenfd);
@@ -981,8 +981,15 @@ int main(int argc, char *argv[])
 	    (server && (!certfile || !pkeyfile)))
 		usage();
 
-	if (client)
-		return do_client(argv[0]);
+	if (client) {
+		switch (testcase) {
+		case IOP_HTTP3:
+			return do_http3_client(argv[0]);
+		}
+	}
 
-	return do_server(pkeyfile, certfile, argv[0]);
+	switch (testcase) {
+	case IOP_HTTP3:
+		return do_http3_server(pkeyfile, certfile, argv[0]);
+	}
 }
