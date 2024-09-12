@@ -889,34 +889,51 @@ free:
 	return 0;
 }
 
+static void usage(void)
+{
+	fprintf(stderr,
+"usage: interop_test -c -T testcase url\n"
+"       interop_test -s -C certfile -P pkeyfile address:port\n"
+	);
+	exit(255);
+}
+
 int main(int argc, char *argv[])
 {
-	if (argc < 2)
-		goto err;
+	int ch, server = 0, client = 0;
+	char *certfile = NULL, *pkeyfile = NULL, *testcase = NULL;
 
-	if (!strcmp(argv[1], "-c")) {
-		if (argc < 3) {
-			http_log_info("\n  %s -c <URI>\n", argv[0]);
-			http_log_info("\n    e.g. %s -c https://www.google.com/\n", argv[0]);
-			http_log_info("\n");
-			return -1;
+	while ((ch = getopt(argc, argv, "C:P:T:cs")) != -1) {
+		switch (ch) {
+		case 'C':
+			certfile = optarg;
+			break;
+		case 'P':
+			pkeyfile = optarg;
+			break;
+		case 'T':
+			testcase = optarg;
+			break;
+		case 'c':
+			client = 1;
+			break;
+		case 's':
+			server = 1;
+			break;
+		default:
+			usage();
 		}
-		return do_client(argv[2]);
 	}
+	argc -= optind;
+	argv += optind;
 
-	if (!strcmp(argv[1], "-s")) {
-		if (argc < 5) {
-			http_log_info("\n  %s -s <ADDR:PORT> <PKEY_FILE> <CERT_FILE>\n", argv[0]);
-			http_log_info("\n    e.g. %s -s 127.0.0.1:443 "
-				      "./keys/server-key.pem ./keys/server-cert.pem\n", argv[0]);
-			http_log_info("\n");
-			return -1;
-		}
-		return do_server(argv[2], argv[3], argv[4]);
-	}
+	if (argc != 1 || (!client && !server) ||
+	    (client && (certfile || pkeyfile || !testcase)) || 
+	    (server && (!certfile || !pkeyfile || testcase)))
+		usage();
 
-err:
-	http_log_info("\n  %s <-c | -s> ...\n", argv[0]);
-	http_log_info("\n");
-	return -1;
+	if (client)
+		return do_client(argv[0]);
+
+	return do_server(pkeyfile, certfile, argv[0]);
 }
