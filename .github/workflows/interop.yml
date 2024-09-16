@@ -3,7 +3,7 @@ name: interop
 on:
   push:
     branches:
-    - main
+    - interop
 
 permissions: read-all
 
