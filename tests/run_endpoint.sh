@@ -4,6 +4,15 @@ set -e
 # Set up the routing needed for the simulation.
 /setup.sh
 
+case $TESTCASE in
+    versionnegotiation|handshake|transfer|retry|resumption|http3|multiconnect|zerortt|chacha20|keyupdate|ecn|v2)
+        :
+        ;;
+    *)
+        exit 127
+        ;;
+esac
+
 if [ "$ROLE" == "client" ]; then
     # Wait for the simulator to start up.
     /wait-for-it.sh sim:57832 -s -t 10
