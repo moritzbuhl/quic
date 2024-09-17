@@ -972,8 +972,8 @@ int main(int argc, char *argv[])
 
 	testcase = iop_get_testcase();
 	if (!testcase || (server && testcase == IOP_KEYUPDATE)) {
-		fprintf(stderr, "unknown test case\n");
-		return 1;
+		fprintf(stderr, "unsupported test case\n");
+		return 127;
 	}
 
 	if (argc != 1 || (!client && !server) || !testcase ||
