@@ -19,7 +19,8 @@ RUN git clone https://github.com/moritzbuhl/quic && \
     cd quic && \
     git checkout ${GITREF} && \
     ./autogen.sh && \
-    ls -l /lib/modules/ && \
+    mkdir -p /lib/modules/`uname -r`/kernel/net/quic && \
+    install -m 644 modules/include/uapi/linux/quic.h /usr/include/linux && \
     ./configure --prefix=/usr && \
     make && \
     make install && \
