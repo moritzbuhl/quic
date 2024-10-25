@@ -95,21 +95,6 @@ static void http_log_debug(char const *fmt, ...)
 	printf("[DEBUG] %s", msg);
 }
 
-static void http_log_info(char const *fmt, ...)
-{
-	char msg[128];
-	va_list arg;
-
-	if (http_log_level < LOG_INFO)
-		return;
-
-	va_start(arg, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, arg);
-	va_end(arg);
-
-	printf("%s", msg);
-}
-
 static void http_log_error(char const *fmt, ...)
 {
 	char msg[128];
@@ -123,20 +108,6 @@ static void http_log_error(char const *fmt, ...)
 	va_end(arg);
 
 	printf("[ERROR] %s", msg);
-}
-
-static void print_buffer_as_hex(char *title, const void *buffer, size_t length)
-{
-	const unsigned char *buf = (const unsigned char *)buffer;
-
-	printf("%s\n", title);
-	for (size_t i = 0; i < length; i++) {
-		printf("%02x ", buf[i]);
-		if ((i + 1) % 64 == 0) {
-			printf("\n"); 
-		}
-	}
-	printf("\n");
 }
 
 /* common nghttp3 callback functions s */
@@ -788,22 +759,24 @@ static int http3_client_end_headers(nghttp3_conn *conn, int64_t stream_id, int f
 {
 	struct http_ctx *ctx = user_data;
 	struct http_req *req;
-	char path[128] = {};
-	int fd, ret;
+	char *path;
+	int ret;
 
 	req = &ctx->reqs[stream_id >> 2];
-	ret = sprintf(path, "%s%s", ctx->root, req->path);
+	ret = asprintf(&path, "%s%s", ctx->root, req->path);
 	if (ret < 0)
 		return -1;
 	http_log_debug("%s: %s\n", __func__, path);
 
 	req->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (fd < 0) {
+	if (req->fd < 0) {
 		http_log_error("can not open file %s\n", path);
+		free(path);
 		return 0;
 	}
 
 	http_log_debug("%s\n", __func__);
+	free(path);
 	return 0;
 }
 
@@ -984,7 +957,7 @@ static int http3_server_end_stream(nghttp3_conn *conn, int64_t stream_id, void *
 	char len[10], status[] = "200";
 	nghttp3_data_reader dr = {};
 	struct http_req *req;
-	char path[128] = {};
+	char *path;
 	nghttp3_nv nva[4];
 	struct stat st;
 	int ret, fd;
@@ -999,12 +972,13 @@ static int http3_server_end_stream(nghttp3_conn *conn, int64_t stream_id, void *
 		goto send;
 	}
 
-	ret = sprintf(path, "%s%s", ctx->root, req->path);
+	ret = asprintf(&path, "%s%s", ctx->root, req->path);
 	if (ret < 0)
 		return -1;
 	http_log_debug("%s: %s\n", __func__, path);
 
 	fd = open(path, O_RDONLY);
+	free(path);
 	if (fd < 0) {
 		req->len = 16;
 		strcpy(status, "404");
@@ -1142,9 +1116,8 @@ static int http3_client(char *urls, const char *root, int testcase)
 	char *p, *url = strtok_r(urls, " ", &p);
 	struct quic_stream_info sinfo = {};
 	nghttp3_conn *httpconn = NULL;
-	int len = sizeof(sinfo);
+	socklen_t len = sizeof(sinfo);
 	struct http_ctx *ctx;
-	struct http_req *req;
 	int sockfd, ret = 0;
 	int64_t stream_id;
 
@@ -1274,28 +1247,21 @@ out:
 	return ret;
 }
 
-static long long http_get_time() {
-    struct timespec ts;
-
-    clock_gettime(CLOCK_REALTIME, &ts);
-
-    return (long long)(ts.tv_sec) * 1000 + (ts.tv_nsec) / 1000000;
-}
-
 /* http/0.9 functions */
 static int http09_submit_request(struct http_ctx *ctx, int64_t stream_id)
 {
 	struct http_req *req = &ctx->reqs[stream_id >> 2];
 	uint32_t flags = MSG_STREAM_FIN;
 	int ret, sockfd = ctx->sockfd;
-	char data[128] = {};
+	char *data;
 
-	ret = sprintf(data, "GET %s%s", req->path, "\r\n");
+	ret = asprintf(&data, "GET %s%s", req->path, "\r\n");
 	if (ret < 0)
 		return -1;
 	http_log_debug("%s: %s\n", __func__, data);
 
 	ret = quic_sendmsg(sockfd, data, strlen(data), stream_id, flags);
+	free(data);
 	if (ret < 0)
 		return -1;
 	return 0;
@@ -1308,10 +1274,10 @@ static int http09_client_recv_data(struct http_ctx *ctx, int64_t stream_id, uint
 	static size_t total;
 
 	if (!req->fd) {
-		char path[128] = {};
+		char *path;
 		int ret;
 
-		ret = sprintf(path, "%s%s", ctx->root, req->path);
+		ret = asprintf(&path, "%s%s", ctx->root, req->path);
 		if (ret < 0)
 			return -1;
 		http_log_debug("%s: %s\n", __func__, path);
@@ -1319,8 +1285,10 @@ static int http09_client_recv_data(struct http_ctx *ctx, int64_t stream_id, uint
 		req->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (req->fd < 0) {
 			http_log_error("can not open file %s\n", path);
+			free(path);
 			return -1;
 		}
+		free(path);
 	}
 
 	if (write(req->fd, data, datalen) == -1) {
@@ -1347,7 +1315,7 @@ static int http09_server_recv_data(struct http_ctx *ctx, int64_t stream_id, uint
 {
 	struct http_req *req = &ctx->reqs[stream_id >> 2];
 	int sockfd = ctx->sockfd;
-	char path[128] = {};
+	char *path;
 	struct stat st;
 	int ret, fd;
 
@@ -1370,12 +1338,13 @@ static int http09_server_recv_data(struct http_ctx *ctx, int64_t stream_id, uint
 		goto send;
 	}
 
-	ret = sprintf(path, "%s%s", ctx->root, req->path);
+	ret = asprintf(&path, "%s%s", ctx->root, req->path);
 	if (ret < 0)
 		return -1;
 	http_log_debug("%s: %s\n", __func__, path);
 
 	fd = open(path, O_RDONLY);
+	free(path);
 	if (fd < 0) {
 		req->len = 16;
 		req->data = malloc(req->len);
@@ -1457,10 +1426,9 @@ static int http09_client(char *urls, const char *sess_file, const char *tp_file,
 	char *p, *url = strtok_r(urls, " ", &p);
 	struct quic_stream_info sinfo = {};
 	struct quic_transport_param param;
-	int i, len = sizeof(sinfo);
+	socklen_t len = sizeof(sinfo);
 	unsigned int param_len;
 	struct http_ctx *ctx;
-	struct http_req *req;
 	int sockfd, ret = 0;
 	int64_t stream_id;
 	size_t buf_len;
@@ -1647,11 +1615,6 @@ out:
 	return ret;
 }
 
-static int http09_session_client(char *urls, const char *sess_file, const char *tp_file,
-				 const char *root, int testcase)
-{
-}
-
 /* iop functions */
 static int iop_get_testcase(void)
 {
@@ -1718,9 +1681,9 @@ int main(int argc, char *argv[])
 	char *sessfile = "./session.bin", *tpfile = "./tp.bin", *root = "./";
 	int server = 0, client = 0, testcase = 0;
 	char *certfile = NULL, *pkeyfile = NULL;
-	int fd, ch;
+	int ch;
 
-	while ((ch = getopt(argc, argv, "C:P:S:T:D:cs")) != -1) {
+	while ((ch = getopt(argc, argv, "C:D:P:S:T:cs")) != -1) {
 		switch (ch) {
 		case 'C':
 			certfile = optarg;
