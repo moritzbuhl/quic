@@ -1,6 +1,7 @@
 #include <nghttp3/nghttp3.h>
 #include <netinet/quic.h>
 #include <sys/syslog.h>
+#include <linux/tls.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string.h>
@@ -12,50 +13,72 @@
 
 static int http_log_level = LOG_INFO;
 
-/*
- * https://github.com/quic-interop/quic-interop-runner/
- * https://github.com/quic-go/quic-go/blob/master/interop/client/main.go
- * https://github.com/quic-go/quic-go/blob/master/interop/server/main.go
- */
-#define IOP_CHACHA20		1
-#define IOP_HANDSHAKE		2
-#define IOP_HTTP3		3
-#define IOP_KEYUPDATE		4
-#define IOP_MULTICONNECT	5
-#define IOP_RESUMPTION		6
-#define IOP_RETRY		7
-#define IOP_TRANSFER		8
-#define IOP_VERSIONNEGOTIATION	9
-#define IOP_ZERORTT		10
+#define QUIC_PRIORITY_CHACHA20 \
+	"NORMAL:-VERS-ALL:+VERS-TLS1.3:+PSK:-CIPHER-ALL:" \
+	"+CHACHA20-POLY1305:-GROUP-ALL:+GROUP-SECP256R1:" \
+	"+GROUP-X25519:+GROUP-SECP384R1:+GROUP-SECP521R1:" \
+	"%DISABLE_TLS13_COMPAT_MODE"
 
-static int iop_get_testcase(void)
-{
-	char *testcase = getenv("TESTCASE");
-	if (!testcase) {
-		return 0;
-	} else if(!strcmp(testcase, "chacha20")) {
-		return IOP_CHACHA20;
-	} else if(!strcmp(testcase, "handshake")) {
-		return IOP_HANDSHAKE;
-	} else if(!strcmp(testcase, "http3")) {
-		return IOP_HTTP3;
-	} else if(!strcmp(testcase, "keyupdate")) {
-		return IOP_KEYUPDATE;
-	} else if(!strcmp(testcase, "multiconnect")) {
-		return IOP_MULTICONNECT;
-	} else if(!strcmp(testcase, "resumption")) {
-		return IOP_RESUMPTION;
-	} else if(!strcmp(testcase, "retry")) {
-		return IOP_RETRY;
-	} else if(!strcmp(testcase, "transfer")) {
-		return IOP_TRANSFER;
-	} else if (!strcmp(testcase, "versionnegotiation")) {
-		return IOP_VERSIONNEGOTIATION;
-	} else if(!strcmp(testcase, "zerortt")) {
-		return IOP_ZERORTT;
-	}
-	return 0;
-}
+#define IOP_CHACHA20		1 /* DONE */
+#define IOP_HANDSHAKE		2 /* DONE */
+#define IOP_HTTP3		3 /* DONE */
+#define IOP_KEYUPDATE		4 /* DONE (can't test, SSLKEYLOGFILE issue) */
+#define IOP_MULTICONNECT	5 /* TBD */
+#define IOP_RESUMPTION		6 /* DONE (can't test, SSLKEYLOGFILE issue) */
+#define IOP_RETRY		7 /* DONE */
+#define IOP_TRANSFER		8 /* DONE */
+#define IOP_VERSIONNEGOTIATION	9 /* DONE (can't test, somehow disabled by interop) */
+#define IOP_ZERORTT		10 /* DONE (can't test, SSLKEYLOGFILE issue) */
+#define IOP_IPV6		11 /* DONE */
+#define IOP_V2			12 /* DONE (can't test, SSLKEYLOGFILE issue) */
+#define IOP_GOODPUT		13 /* DONE */
+#define IOP_ECN			14 /* DONE (can't test, SSLKEYLOGFILE issue) */
+#define IOP_MULTIPLEXING	15 /* DONE */
+#define IOP_TRANSFERLOSS	16 /* DONE */
+#define IOP_HANDSHAKECORRUPTION	17 /* TBD */
+#define IOP_TRANSFERCORRUPTION	18 /* DONE */
+#define IOP_LONGRTT		19 /* TBD */
+#define IOP_BLACKHOLE		20 /* DONE */
+#define IOP_CROSSTRFFIC		21 /* DONE */
+#define IOP_AMPLIFICATIONLIMIT	22 /* TBD */
+
+/* handshake,chacha20,retry,http3,ipv6,transfer,transferloss,transfercorruption,blackhole,multiplexing (DONE)
+ * goodput, crosstraffic (DONE, Performance Testing)
+ * ecn, keyupdate, v2, resumption, zerortt (DONE, tshark doesn't support SSLKEYLOGFILE on my host)
+ * longrtt, amplificationlimit (TBD)
+ * versionnegotiation, handshakeloss, handshakecorruption (N/A)
+ */
+
+struct http_req {
+	char			user_agent[32];
+	char			path[128];
+	char			method[8];
+	char			scheme[8];
+	char			host[128];
+	char			port[16];
+
+	int			fd;
+	uint32_t		len;
+	uint8_t			*data;
+};
+
+struct http_ctx {
+	char			user_agent[32];
+	char			path[128];
+	char			method[8];
+	char			scheme[8];
+	char			host[128];
+	char			port[16];
+
+	struct http_req		reqs[2048];
+	uint8_t			buf[4096];
+	uint32_t		req_cnt;
+	uint8_t			complete;
+	uint8_t			is_serv;
+	char			root[32];
+	int			sockfd;
+	int			errcode;
+};
 
 static void http_log_debug(char const *fmt, ...)
 {
@@ -102,20 +125,21 @@ static void http_log_error(char const *fmt, ...)
 	printf("[ERROR] %s", msg);
 }
 
-struct http_request {
-	char		method[8];
-	char		scheme[8];
-	char		host[128];
-	char		port[16];
-	char		path[128];
-	char		user_agent[32];
+static void print_buffer_as_hex(char *title, const void *buffer, size_t length)
+{
+	const unsigned char *buf = (const unsigned char *)buffer;
 
-	uint8_t		done;
-	uint32_t	len;
-	uint8_t		*data;
-	int64_t		stream_id;
-};
+	printf("%s\n", title);
+	for (size_t i = 0; i < length; i++) {
+		printf("%02x ", buf[i]);
+		if ((i + 1) % 64 == 0) {
+			printf("\n"); 
+		}
+	}
+	printf("\n");
+}
 
+/* common nghttp3 callback functions s */
 static int http3_acked_stream_data(nghttp3_conn *conn, int64_t stream_id, uint64_t datalen,
 				   void *user_data, void *stream_user_data)
 {
@@ -208,81 +232,149 @@ static int http3_shutdown(nghttp3_conn *conn, int64_t id, void *conn_user_data)
 	return 0;
 }
 
-static int http3_recv_data(nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
-			   size_t datalen, void *user_data, void *stream_user_data)
+
+static int http_read_file(const char *filename, uint8_t *buf, size_t *buf_len)
 {
-	static size_t total;
-	int i;
+	struct stat st;
+	int ret, fd;
 
-	for (i = 0; i < datalen; i++)
-		http_log_info("%c", data[i]);
+	*buf_len = 0;
 
-	total += datalen;
-	http_log_debug("\n");
-	http_log_debug("%s: %lu\n", __func__, total);
-	return 0;
-}
+	ret = stat(filename, &st);
+	if (ret || !st.st_size)
+		return 0;
 
-static int http3_client_end_stream(nghttp3_conn *conn, int64_t stream_id, void *user_data,
-				   void *stream_user_data)
-{
-	struct http_request *req = user_data;
-
-	http_log_info("\n");
-	req->done = 1;
-	return 0;
-}
-
-static int http_parse_url(const char *url, struct http_request *req)
-{
-	char *colon_pos, *slash_pos;
-
-	req->done = 0;
-	strcpy(req->method, "GET");
-	strcpy(req->user_agent, "nghttp3/quic client"); /* XXX */
-	if (!strncmp(url, "https://", 8)) {
-		strcpy(req->scheme, "https");
-		url += 8;
-	} else if (!strncmp(url, "http://", 7)) {
-		strcpy(req->scheme, "http");
-		url += 7;
-	} else {
+	fd= open(filename, O_RDONLY);
+	if (fd == -1) {
+		http_log_error("open file %s failed for read\n", filename);
 		return -1;
 	}
 
-	colon_pos = strchr(url, ':');
-	slash_pos = strchr(url, '/');
-
-	if (colon_pos && (slash_pos == NULL || colon_pos < slash_pos)) {
-		strncpy(req->host, url, colon_pos - url);
-		req->host[colon_pos - url] = '\0';
-		if (slash_pos) {
-			strncpy(req->port, colon_pos + 1, slash_pos - colon_pos - 1);
-			req->port[slash_pos - colon_pos - 1] = '\0';
-			strcpy(req->path, slash_pos);
-		} else {
-			strcpy(req->port, colon_pos + 1);
-			strcpy(req->path, "/");
-		}
-	} else {
-		if (slash_pos) {
-			strncpy(req->host, url, slash_pos - url);
-			req->host[slash_pos - url] = '\0';
-			strcpy(req->path, slash_pos);
-		} else {
-			strcpy(req->host, url);
-			strcpy(req->path, "/");
-		}
-		strcpy(req->port, "443");
+	ret = read(fd, buf, st.st_size);
+	if (ret == -1) {
+		http_log_error("write file %s failed\n", filename);
+		goto out;
 	}
-	return 0;
+
+	*buf_len = ret;
+out:
+	close(fd);
+	return ret;
 }
 
-static int http3_client_setup_socket(char *host, char *port)
+static int http_write_file(const char *filename, uint8_t *buf, size_t buf_len)
+{
+	int ret, fd;
+
+	fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd == -1) {
+		http_log_error("open file %s failed for write\n", filename);
+		return -1;
+	}
+
+	ret = write(fd, buf, buf_len);
+	if (ret == -1) {
+		http_log_error("write file %s failed\n", filename);
+		close(fd);
+		return -1;
+	}
+
+	close(fd);
+	return ret;
+}
+
+/* http common functions */
+static int http_client_handshake(int sockfd, const char *alpns, const char *host, uint8_t *buf,
+				 const char *sess_file, int testcase)
+{
+	gnutls_certificate_credentials_t cred;
+	char alpn[64], *prio = QUIC_PRIORITY;
+	size_t buf_len, alpn_len;
+	gnutls_session_t session;
+	int ret;
+
+	ret = gnutls_certificate_allocate_credentials(&cred);
+	if (ret)
+		goto err;
+	ret = gnutls_certificate_set_x509_system_trust(cred);
+	if (ret < 0)
+		goto err_cred;
+
+	ret = gnutls_init(&session, GNUTLS_CLIENT |
+				    GNUTLS_ENABLE_EARLY_DATA | GNUTLS_NO_END_OF_EARLY_DATA);
+	if (ret)
+		goto err_cred;
+	ret = gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, cred);
+	if (ret)
+		goto err_session;
+
+	if (testcase == IOP_CHACHA20)
+		prio = QUIC_PRIORITY_CHACHA20;
+
+	ret = gnutls_priority_set_direct(session, prio, NULL);
+	if (ret)
+		goto err_session;
+
+	if (alpns) {
+		ret = quic_session_set_alpn(session, alpns, strlen(alpns));
+		if (ret)
+			goto err_session;
+	}
+
+	if (host) {
+		ret = gnutls_server_name_set(session, GNUTLS_NAME_DNS, host, strlen(host));
+		if (ret)
+			goto err_session;
+	}
+
+	gnutls_transport_set_int(session, sockfd);
+
+	if (testcase == IOP_RESUMPTION || testcase == IOP_ZERORTT) { /* load session ticket */
+		if (http_read_file(sess_file, buf, &buf_len) < 0)
+			goto err_session;
+		if (buf_len) {
+			ret = quic_session_set_data(session, buf, buf_len);
+			if (ret)
+				goto err_session;
+		}
+	}
+
+	ret = quic_handshake(session);
+	if (ret)
+		goto err_session;
+
+	if (alpns) {
+		alpn_len = sizeof(alpn);
+		ret = quic_session_get_alpn(session, alpn, &alpn_len);
+	}
+
+	if (testcase == IOP_RESUMPTION || testcase == IOP_ZERORTT) { /* save session ticket */
+		sleep(1);
+		buf_len = 4096;
+		ret = quic_session_get_data(session, buf, &buf_len);
+		if (ret)
+			goto err_session;
+		if (buf_len) {
+			if (http_write_file(sess_file, buf, buf_len) <= 0) {
+				ret = -errno;
+				goto err_session;
+			}
+		}
+	}
+
+err_session:
+	gnutls_deinit(session);
+err_cred:
+	gnutls_certificate_free_credentials(cred);
+err:
+	return ret;
+}
+
+static int http_client_setup_socket(char *host, char *port, int testcase)
 {
 	struct quic_transport_param param = {};
-	struct addrinfo *rp, *res;
-	char *alpn = "h3, h3-29";
+	struct addrinfo *rp = NULL, *res, *p;
+	struct quic_config config = {};
 	int sockfd;
 
 	if (getaddrinfo(host, port, NULL, &res)) {
@@ -290,12 +382,17 @@ static int http3_client_setup_socket(char *host, char *port)
 		return -1;
 	}
 
-	for (rp = res; rp != NULL; rp = rp->ai_next) {
-		if (rp->ai_family == AF_INET)
+	for (p = res; p != NULL; p = p->ai_next) {
+		if (p->ai_family == AF_INET) {
+			rp = p;
 			break;
+		}
+		if (p->ai_family == AF_INET6)
+			rp = p;
 	}
 
 	if (!rp) {
+		errno = EINVAL;
 		http_log_error("ai_family doesn't support\n");
 		goto err_free;
 	}
@@ -304,6 +401,14 @@ static int http3_client_setup_socket(char *host, char *port)
 	if (sockfd < 0) {
 		http_log_error("socket create failed\n");
 		goto err_free;
+	}
+
+	if (testcase == IOP_VERSIONNEGOTIATION)
+		config.version = 123;
+
+	if (setsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_CONFIG, &config, sizeof(config))) {
+		http_log_error("socket setsockopt config failed\n");
+		goto err_close;
 	}
 
 	param.grease_quic_bit = 1;
@@ -317,10 +422,6 @@ static int http3_client_setup_socket(char *host, char *port)
 		goto err_close;
 	}
 
-	if (quic_client_handshake(sockfd, NULL, host, alpn))
-		goto err_close;
-
-	http_log_debug("HANDSHAKE DONE\n");
 	freeaddrinfo(res);
 	return sockfd;
 
@@ -331,237 +432,11 @@ err_free:
 	return -1;
 }
 
-static int http3_client_create_conn(nghttp3_conn **httpconn, int sockfd, struct http_request *req)
-{
-	int64_t ctrl_stream_id, qpack_enc_stream_id, qpack_dec_stream_id;
-	const nghttp3_mem *mem = nghttp3_mem_default();
-	nghttp3_callbacks callbacks = {
-		http3_acked_stream_data,
-		http3_stream_close,
-		http3_recv_data,
-		http3_deferred_consume,
-		http3_begin_headers,
-		http3_recv_header,
-		http3_end_headers,
-		http3_begin_trailers,
-		http3_recv_trailer,
-		http3_end_trailers,
-		http3_stop_sending,
-		http3_client_end_stream,
-		http3_reset_stream,
-		http3_shutdown,
-		http3_recv_settings,
-	};
-	struct quic_stream_info sinfo;
-	socklen_t len = sizeof(sinfo);
-	nghttp3_settings settings;
-	int ret;
-
-	nghttp3_settings_default(&settings);
-	settings.qpack_blocked_streams = 100;
-	settings.qpack_max_dtable_capacity = 4096;
-
-	ret = nghttp3_conn_client_new(httpconn, &callbacks, &settings, mem, req);
-	if (ret)
-		return -1;
-
-	sinfo.stream_id = -1;
-	sinfo.stream_flags = MSG_STREAM_UNI;
-	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len);
-	if (ret) {
-		http_log_error("socket getsockopt stream_open ctrl failed\n");
-		return -1;
-	}
-	ctrl_stream_id = sinfo.stream_id;
-	ret = nghttp3_conn_bind_control_stream(*httpconn, ctrl_stream_id);
-	if (ret)
-		return -1;
-	http_log_debug("%s ctrl_stream_id %llu\n", __func__, ctrl_stream_id);
-
-	sinfo.stream_id = -1;
-	sinfo.stream_flags = MSG_STREAM_UNI;
-	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len);
-	if (ret) {
-		http_log_error("socket getsockopt stream_open enc failed\n");
-		return -1;
-	}
-	qpack_enc_stream_id = sinfo.stream_id;
-	http_log_debug("%s qpack_enc_stream_id %llu\n", __func__, qpack_enc_stream_id);
-
-	sinfo.stream_id = -1;
-	sinfo.stream_flags = MSG_STREAM_UNI;
-	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len);
-	if (ret) {
-		http_log_error("socket getsockopt stream_open dec failed\n");
-		return -1;
-	}
-	qpack_dec_stream_id = sinfo.stream_id;
-	http_log_debug("%s qpack_dec_stream_id %llu\n", __func__, qpack_dec_stream_id);
-	ret = nghttp3_conn_bind_qpack_streams(*httpconn, qpack_enc_stream_id,
-					      qpack_dec_stream_id);
-	if (ret)
-		return -1;
-
-	return 0;
-}
-
-static int http3_write_data(nghttp3_conn *httpconn, int sockfd)
-{
-	int ret, i, flags = 0, fin = 0, sent;
-	int64_t stream_id = -1;
-	nghttp3_vec vec[16];
-	nghttp3_ssize cnt;
-
-	while (1) {
-		cnt = nghttp3_conn_writev_stream(httpconn, &stream_id, &fin, vec, 16);
-		if (cnt <= 0)
-			return cnt;
-		sent = 0;
-		for (i = 0; i < cnt; i++) {
-			if (i == cnt - 1 && fin)
-				flags |= MSG_STREAM_FIN;
-			http_log_debug("%s: %d %ld %d\n", __func__, vec[i].len, stream_id, flags);
-			ret = quic_sendmsg(sockfd, vec[i].base, vec[i].len, stream_id, flags);
-			if (ret < 0)
-				return -1;
-			sent += ret;
-		}
-		ret = nghttp3_conn_add_write_offset(httpconn, stream_id, sent);
-		if (ret)
-			return -1;
-	}
-	return 0;
-}
-
-static int http3_read_data(nghttp3_conn *httpconn, int sockfd)
-{
-	int64_t stream_id = -1;
-	uint32_t flags = 0;
-	uint8_t buf[2048];
-	int ret;
-
-	while (1) {
-		flags |= MSG_DONTWAIT;
-		ret = quic_recvmsg(sockfd, &buf, sizeof(buf), &stream_id, &flags);
-		if (ret <= 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				return 0;
-			return -1;
-		}
-		http_log_debug("%s: %d %ld %d\n", __func__, ret, stream_id, flags);
-		ret = nghttp3_conn_read_stream(httpconn, stream_id, buf, ret,
-					       flags & MSG_STREAM_FIN);
-		if (ret < 0)
-			return -1;
-	}
-	return 0;
-}
-
-static void http3_make_nv(nghttp3_nv *nv, char *name, char *value)
-{
-	nv->name = (uint8_t *)name;
-	nv->value = (uint8_t *)value;
-	nv->namelen = strlen(name);
-	nv->valuelen = strlen(value);
-	nv->flags = NGHTTP3_NV_FLAG_NONE;
-}
-
-static int http3_submit_request(nghttp3_conn *httpconn, int sockfd, struct http_request *req)
-{
-	struct quic_stream_info sinfo;
-	socklen_t len = sizeof(sinfo);
-	nghttp3_nv nva[5];
-	int i, ret;
-
-	sinfo.stream_id = -1;
-	sinfo.stream_flags = 0;
-	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len);
-	if (ret) {
-		http_log_error("socket getsockopt stream_open bidi failed\n");
-		return -1;
-	}
-
-	http3_make_nv(&nva[0], ":method", req->method);
-	http3_make_nv(&nva[1], ":scheme", req->scheme);
-	http3_make_nv(&nva[2], ":authority", req->host);
-	http3_make_nv(&nva[3], ":path", req->path);
-	http3_make_nv(&nva[4], "user-agent", req->user_agent);
-
-	for (i = 0; i < 5; i++)
-		http_log_debug("%s: %s -> %s\n", __func__, nva[i].name, nva[i].value);
-
-	ret = nghttp3_conn_submit_request(httpconn, sinfo.stream_id, nva, 5, NULL, NULL);
-	if (ret)
-		return -1;
-
-	return http3_write_data(httpconn, sockfd);
-}
-
-static int http3_run_loop(nghttp3_conn *httpconn, int sockfd, struct http_request *req)
-{
-	struct timeval tv;
-	fd_set readfds;
-	int ret;
-
-	while (!req->done) {
-		tv.tv_sec = 1;
-		tv.tv_usec = 0;
-		FD_ZERO(&readfds);
-		FD_SET(sockfd, &readfds);
-
-		ret = select(sockfd + 1, &readfds, NULL,  NULL, &tv);
-		if (ret < 0)
-			return -1;
-		ret = http3_read_data(httpconn, sockfd);
-		if (ret < 0)
-			return -1;
-		ret = http3_write_data(httpconn, sockfd);
-		if (ret < 0)
-			return -1;
-	}
-	return 0;
-}
-
-static void http3_conn_free(nghttp3_conn *httpconn, int sockfd)
-{
-	close(sockfd);
-	nghttp3_conn_del(httpconn);
-}
-
-static int do_http3_client(const char *url)
-{
-	nghttp3_conn *httpconn = NULL;
-	struct http_request req;
-	int sockfd, ret;
-
-	ret = http_parse_url(url, &req);
-	if (ret)
-		return -1;
-
-	sockfd = http3_client_setup_socket(req.host, req.port);
-	if (sockfd < 0)
-		return -1;
-
-	ret = http3_client_create_conn(&httpconn, sockfd, &req);
-	if (ret)
-		goto out;
-
-	ret = http3_submit_request(httpconn, sockfd, &req);
-	if (ret)
-		goto out;
-
-	ret = http3_run_loop(httpconn, sockfd, &req);
-
-out:
-	http3_conn_free(httpconn, sockfd);
-	return ret;
-}
-
-static int http3_server_setup_socket(char *host, char *port)
+static int http_server_setup_socket(char *host, char *port, char *alpn, int testcase)
 {
 	struct quic_transport_param param = {};
-	struct addrinfo *rp, *res;
-	char *alpn = "h3, h3-29";
+	struct addrinfo *rp = NULL, *res, *p;
+	struct quic_config config = {};
 	int listenfd;
 
 	if (getaddrinfo(host, port, NULL, &res)) {
@@ -569,12 +444,17 @@ static int http3_server_setup_socket(char *host, char *port)
 		return -1;
 	}
 
-	for (rp = res; rp != NULL; rp = rp->ai_next) {
-		if (rp->ai_family == AF_INET)
+	for (p = res; p != NULL; p = p->ai_next) {
+		if (p->ai_family == AF_INET) {
+			rp = p;
 			break;
+		}
+		if (p->ai_family == AF_INET6)
+			rp = p;
 	}
 
 	if (!rp) {
+		errno = EINVAL;
 		http_log_error("ai_family doesn't support\n");
 		goto err_free;
 	}
@@ -586,6 +466,16 @@ static int http3_server_setup_socket(char *host, char *port)
 	}
 	if (bind(listenfd, rp->ai_addr, rp->ai_addrlen)) {
 		http_log_error("socket bind failed\n");
+		goto err_close;
+	}
+
+	if (testcase == IOP_RETRY)
+		config.validate_peer_address = 1;
+	if (testcase == IOP_V2)
+		config.version = QUIC_VERSION_V2;
+
+	if (setsockopt(listenfd, SOL_QUIC, QUIC_SOCKOPT_CONFIG, &config, sizeof(config))) {
+		http_log_error("socket setsockopt config failed\n");
 		goto err_close;
 	}
 
@@ -615,14 +505,14 @@ err_free:
 	return -1;
 }
 
-static int server_handshake(int sockfd, const char *pkey, const char *cert, const char *alpns,
-			    uint8_t *key, unsigned int keylen)
+static int http_server_handshake(int sockfd, const char *pkey, const char *cert, const char *alpns,
+				 uint8_t *key, unsigned int keylen, int testcase)
 {
 	gnutls_certificate_credentials_t cred;
+	char alpn[64], *prio = QUIC_PRIORITY;
 	gnutls_datum_t skey = {key, keylen};
 	gnutls_session_t session;
 	size_t alpn_len;
-	char alpn[64];
 	int ret;
 
 	ret = gnutls_certificate_allocate_credentials(&cred);
@@ -646,7 +536,10 @@ static int server_handshake(int sockfd, const char *pkey, const char *cert, cons
 	if (ret)
 		goto err_session;
 
-	ret = gnutls_priority_set_direct(session, QUIC_PRIORITY, NULL);
+	if (testcase == IOP_CHACHA20)
+		prio = QUIC_PRIORITY_CHACHA20;
+
+	ret = gnutls_priority_set_direct(session, prio, NULL);
 	if (ret)
 		goto err_session;
 
@@ -675,12 +568,12 @@ err:
 	return ret;
 }
 
-static int http3_server_accept_socket(int listenfd, const char *pkey_file, const char *cert_file)
+static int http_server_accept_socket(int listenfd, const char *pkey_file, const char *cert_file,
+				     char *alpn, int testcase)
 {
-	char *alpn = "h3, h3-29";
 	unsigned int keylen;
 	uint8_t key[64];
-	int sockfd;
+	int ret, sockfd;
 
 	sockfd = accept(listenfd, NULL, NULL);
 	if (sockfd < 0) {
@@ -690,150 +583,247 @@ static int http3_server_accept_socket(int listenfd, const char *pkey_file, const
 
 	keylen = sizeof(key);
 	if (getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_SESSION_TICKET, key, &keylen)) {
-		printf("socket getsockopt session ticket error %d", errno);
+		http_log_error("socket getsockopt session ticket error %d", errno);
 		return -1;
 	}
 
-	if (server_handshake(sockfd, pkey_file, cert_file, alpn, key, keylen))
+	ret = http_server_handshake(sockfd, pkey_file, cert_file, alpn, key, keylen, testcase);
+	if (ret) {
+		errno = -ret;
 		return -1;
+	}
 
 	http_log_debug("HANDSHAKE DONE\n");
 	return sockfd;
 }
 
-static int http3_server_begin_headers(nghttp3_conn *conn, int64_t stream_id, void *user_data,
-				      void *stream_user_data)
+static int http_parse_url(const char *url, struct http_ctx *ctx)
 {
-	struct http_request *req = user_data;
+	char *colon_pos, *slash_pos;
 
-	req->stream_id = stream_id;
-	http_log_debug("%s: %llu\n", __func__, stream_id);
-	return 0;
-}
-
-static int http3_server_recv_header(nghttp3_conn *conn, int64_t stream_id, int32_t token,
-				    nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
-				    void *user_data, void *stream_user_data)
-{
-	nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
-	struct http_request *req = user_data;
-
-	if (req->stream_id != stream_id) {
-		http_log_error("%s: %llu %llu\n", __func__, req->stream_id, stream_id);
+	strcpy(ctx->method, "GET");
+	strcpy(ctx->user_agent, "nghttp3/quic client");
+	if (!strncmp(url, "https://", 8)) {
+		strcpy(ctx->scheme, "https");
+		url += 8;
+	} else if (!strncmp(url, "http://", 7)) {
+		strcpy(ctx->scheme, "http");
+		url += 7;
+	} else {
 		return -1;
 	}
 
-	switch (token) {
-	case NGHTTP3_QPACK_TOKEN__PATH:
-		memcpy(req->path, v.base, v.len);
-		http_log_debug("%s: path %s\n", __func__, req->path);
-		break;
-	case NGHTTP3_QPACK_TOKEN__METHOD:
-		memcpy(req->method, v.base, v.len);
-		http_log_debug("%s: method %s\n", __func__, req->method);
-		break;
-	case NGHTTP3_QPACK_TOKEN__AUTHORITY:
-		memcpy(req->host, v.base, v.len);
-		http_log_debug("%s: host %s\n", __func__, req->host);
-		break;
+	colon_pos = strchr(url, ':');
+	slash_pos = strchr(url, '/');
+
+	if (colon_pos && (slash_pos == NULL || colon_pos < slash_pos)) {
+		strncpy(ctx->host, url, colon_pos - url);
+		ctx->host[colon_pos - url] = '\0';
+		if (slash_pos) {
+			strncpy(ctx->port, colon_pos + 1, slash_pos - colon_pos - 1);
+			ctx->port[slash_pos - colon_pos - 1] = '\0';
+			strcpy(ctx->path, slash_pos);
+		} else {
+			strcpy(ctx->port, colon_pos + 1);
+			strcpy(ctx->path, "/");
+		}
+	} else {
+		if (slash_pos) {
+			strncpy(ctx->host, url, slash_pos - url);
+			ctx->host[slash_pos - url] = '\0';
+			strcpy(ctx->path, slash_pos);
+		} else {
+			strcpy(ctx->host, url);
+			strcpy(ctx->path, "/");
+		}
+		strcpy(ctx->port, "443");
 	}
 	return 0;
 }
 
-static nghttp3_ssize http3_content_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec,
-				        size_t veccnt, uint32_t *pflags, void *user_data,
-				        void *stream_user_data)
+static int http_parse_path(const char *url, struct http_ctx *ctx, int64_t stream_id)
 {
-	struct http_request *req = user_data;
+	struct http_req *req = &ctx->reqs[stream_id >> 2];
+	int ret;
 
-	vec[0].base = req->data;
-	vec[0].len = req->len;
+	ret = http_parse_url(url, ctx);
+	if (ret)
+		return ret;
 
-	*pflags |= NGHTTP3_DATA_FLAG_EOF;
-	return 1;
+	strcpy(req->path, ctx->path);
+	strcpy(req->port, ctx->port);
+	strcpy(req->host, ctx->host);
+	strcpy(req->method, ctx->method);
+	strcpy(req->scheme, ctx->scheme);
+	strcpy(req->user_agent, ctx->user_agent);
+
+	return 0;
 }
 
-static int http3_server_end_stream(nghttp3_conn *conn, int64_t stream_id, void *user_data,
+/* http3 functions */
+static int http3_write_data(struct http_ctx *ctx, nghttp3_conn *httpconn, int sockfd)
+{
+	int ret, i, flags, fin = 0, sent;
+	int64_t stream_id = -1;
+	nghttp3_vec vec[16];
+	nghttp3_ssize cnt;
+
+	while (1) {
+		flags = 0;
+		ret = nghttp3_conn_writev_stream(httpconn, &stream_id, &fin, vec, 16);
+		if (ret <= 0) {
+			errno = -ret;
+			return ret;
+		}
+		cnt = ret;
+		sent = 0;
+		for (i = 0; i < cnt; i++) {
+			if (i == cnt - 1 && fin)
+				flags |= MSG_STREAM_FIN;
+			http_log_debug("%s: %d %ld %d\n", __func__, vec[i].len, stream_id, flags);
+			ret = quic_sendmsg(sockfd, vec[i].base, vec[i].len, stream_id, flags);
+			if (ret < 0)
+				return -1;
+			sent += ret;
+		}
+		ret = nghttp3_conn_add_write_offset(httpconn, stream_id, sent);
+		if (ret) {
+			errno = -ret;
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int http3_read_data(struct http_ctx *ctx, nghttp3_conn *httpconn, int sockfd)
+{
+	int64_t stream_id = -1;
+	uint32_t flags = 0;
+	int ret;
+
+	while (1) {
+		flags |= MSG_DONTWAIT;
+		ret = quic_recvmsg(sockfd, ctx->buf, sizeof(ctx->buf), &stream_id, &flags);
+		if (ret <= 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return 0;
+			return -1;
+		}
+		http_log_debug("%s: %d %ld %d\n", __func__, ret, stream_id, flags);
+		ret = nghttp3_conn_read_stream(httpconn, stream_id, ctx->buf, ret,
+					       flags & MSG_STREAM_FIN);
+		if (ret < 0) {
+			errno = -ret;
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static void http3_make_nv(nghttp3_nv *nv, char *name, char *value)
+{
+	nv->name = (uint8_t *)name;
+	nv->value = (uint8_t *)value;
+	nv->namelen = strlen(name);
+	nv->valuelen = strlen(value);
+	nv->flags = NGHTTP3_NV_FLAG_NONE;
+}
+
+static int http3_submit_request(nghttp3_conn *httpconn, struct http_ctx *ctx, int64_t stream_id)
+{
+	struct http_req *req = &ctx->reqs[stream_id >> 2];
+	int sockfd = ctx->sockfd;
+	nghttp3_nv nva[5];
+	int i, ret;
+
+	http3_make_nv(&nva[0], ":method", req->method);
+	http3_make_nv(&nva[1], ":scheme", req->scheme);
+	http3_make_nv(&nva[2], ":authority", req->host);
+	http3_make_nv(&nva[3], ":path", req->path);
+	http3_make_nv(&nva[4], "user-agent", req->user_agent);
+
+	for (i = 0; i < 5; i++)
+		http_log_debug("%s: %s -> %s\n", __func__, nva[i].name, nva[i].value);
+
+	ret = nghttp3_conn_submit_request(httpconn, stream_id, nva, 5, NULL, NULL);
+	if (ret) {
+		errno = -ret;
+		return -1;
+	}
+
+	return http3_write_data(ctx, httpconn, sockfd);
+}
+
+static int http3_client_recv_data(nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
+				  size_t datalen, void *user_data, void *stream_user_data)
+{
+	struct http_ctx *ctx = user_data;
+	struct http_req *req;
+
+	req = &ctx->reqs[stream_id >> 2];
+	if (write(req->fd, data, datalen) == -1)
+		http_log_error("can not write file\n");
+	return 0;
+}
+
+static int http3_client_end_stream(nghttp3_conn *conn, int64_t stream_id, void *user_data,
 				   void *stream_user_data)
 {
-	struct http_request *req = user_data;
-	char len[10], status[] = "200";
-	nghttp3_data_reader dr = {};
-	char path[128] = {};
-	nghttp3_nv nva[4];
-	struct stat st;
-	int ret, fd;
+	struct http_ctx *ctx = user_data;
+	struct http_req *req;
 
-	if (!strcmp(req->path, "/")) {
-		req->len = 14;
-		req->data = malloc(req->len);
-		if (!req->data)
-			return -1;
-		memcpy(req->data, "Hello, HTTP/3!", req->len);
-		goto send;
-	}
+	req = &ctx->reqs[stream_id >> 2];
+	close(req->fd);
 
-	path[0] = '.';
-	strcpy(&path[1], req->path);
-	http_log_debug("%s: %s\n", __func__, path);
+	http_log_debug("%s %d\n", __func__, ctx->req_cnt);
 
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		req->len = 16;
-		strcpy(status, "404");
-		req->data = malloc(req->len);
-		if (!req->data)
-			return -1;
-		memcpy(req->data, "Sorry, Not Found", req->len);
-		goto send;
-	}
-	ret = fstat(fd, &st);
-	if (ret < 0)
-		return -1;
-	req->len = st.st_size;
-	req->data = malloc(req->len);
-	if (!req->data)
-		return -1;
-	ret = read(fd, req->data, req->len);
-	if (ret < 0)
-		goto err;
-
-send:
-	ret = sprintf(len, "%u", req->len);
-	if (ret < 0)
-		goto err;
-
-	http3_make_nv(&nva[0], ":status", status);
-	http3_make_nv(&nva[1], "server", "nghttp3/quic server");
-	http3_make_nv(&nva[2], "content-type", "text/plain");
-	http3_make_nv(&nva[3], "content-length", len);
-
-	dr.read_data = http3_content_data;
-	return nghttp3_conn_submit_response(conn, stream_id, nva, 4, &dr);
-err:
-	free(req->data);
-	req->data = NULL;
-	return -1;
+	ctx->req_cnt--;
+	if (!ctx->req_cnt)
+		ctx->complete = 1;
+	return 0;
 }
 
-static int http3_server_create_conn(nghttp3_conn **httpconn, int sockfd, struct http_request *req)
+static int http3_client_end_headers(nghttp3_conn *conn, int64_t stream_id, int fin, void *user_data,
+				    void *stream_user_data)
+{
+	struct http_ctx *ctx = user_data;
+	struct http_req *req;
+	char path[128] = {};
+	int fd, ret;
+
+	req = &ctx->reqs[stream_id >> 2];
+	ret = sprintf(path, "%s%s", ctx->root, req->path);
+	if (ret < 0)
+		return -1;
+	http_log_debug("%s: %s\n", __func__, path);
+
+	req->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		http_log_error("can not open file %s\n", path);
+		return 0;
+	}
+
+	http_log_debug("%s\n", __func__);
+	return 0;
+}
+
+static int http3_client_create_conn(nghttp3_conn **httpconn, struct http_ctx *ctx)
 {
 	int64_t ctrl_stream_id, qpack_enc_stream_id, qpack_dec_stream_id;
 	const nghttp3_mem *mem = nghttp3_mem_default();
-	struct quic_transport_param param = {};
 	nghttp3_callbacks callbacks = {
 		http3_acked_stream_data,
 		http3_stream_close,
-		http3_recv_data,
+		http3_client_recv_data,
 		http3_deferred_consume,
-		http3_server_begin_headers,
-		http3_server_recv_header,
-		http3_end_headers,
+		http3_begin_headers,
+		http3_recv_header,
+		http3_client_end_headers,
 		http3_begin_trailers,
 		http3_recv_trailer,
 		http3_end_trailers,
 		http3_stop_sending,
-		http3_server_end_stream,
+		http3_client_end_stream,
 		http3_reset_stream,
 		http3_shutdown,
 		http3_recv_settings,
@@ -841,25 +831,16 @@ static int http3_server_create_conn(nghttp3_conn **httpconn, int sockfd, struct 
 	struct quic_stream_info sinfo;
 	socklen_t len = sizeof(sinfo);
 	nghttp3_settings settings;
-	unsigned int param_len;
+	int sockfd = ctx->sockfd;
 	int ret;
 
-	memset(req, 0, sizeof(*req));
 	nghttp3_settings_default(&settings);
 	settings.qpack_blocked_streams = 100;
 	settings.qpack_max_dtable_capacity = 4096;
 
-	ret = nghttp3_conn_server_new(httpconn, &callbacks, &settings, mem, req);
+	ret = nghttp3_conn_client_new(httpconn, &callbacks, &settings, mem, ctx);
 	if (ret)
 		return -1;
-
-	param_len = sizeof(param);
-	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_TRANSPORT_PARAM, &param, &param_len);
-	if (ret == -1) {
-		http_log_error("socket getsockopt remote transport param\n");
-		return -1;
-	}
-	nghttp3_conn_set_max_client_streams_bidi(*httpconn, param.max_streams_bidi);
 
 	sinfo.stream_id = -1;
 	sinfo.stream_flags = MSG_STREAM_UNI;
@@ -870,8 +851,10 @@ static int http3_server_create_conn(nghttp3_conn **httpconn, int sockfd, struct 
 	}
 	ctrl_stream_id = sinfo.stream_id;
 	ret = nghttp3_conn_bind_control_stream(*httpconn, ctrl_stream_id);
-	if (ret)
+	if (ret) {
+		errno = -ret;
 		return -1;
+	}
 	http_log_debug("%s ctrl_stream_id %llu\n", __func__, ctrl_stream_id);
 
 	sinfo.stream_id = -1;
@@ -895,67 +878,864 @@ static int http3_server_create_conn(nghttp3_conn **httpconn, int sockfd, struct 
 	http_log_debug("%s qpack_dec_stream_id %llu\n", __func__, qpack_dec_stream_id);
 	ret = nghttp3_conn_bind_qpack_streams(*httpconn, qpack_enc_stream_id,
 					      qpack_dec_stream_id);
-	if (ret)
+	if (ret) {
+		errno = -ret;
 		return -1;
+	}
 
 	return 0;
 }
 
-static int do_http3_server(char *host, const char *pkey_file, const char *cert_file)
+static int http3_run_loop(nghttp3_conn *httpconn, struct http_ctx *ctx)
+{
+	int sockfd = ctx->sockfd;
+	struct timeval tv;
+	fd_set readfds;
+	int ret;
+
+	while (!ctx->complete) {
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		FD_ZERO(&readfds);
+		FD_SET(sockfd, &readfds);
+
+		ret = select(sockfd + 1, &readfds, NULL,  NULL, &tv);
+		if (ret < 0)
+			return -1;
+		ret = http3_read_data(ctx, httpconn, sockfd);
+		if (ret < 0) {
+			if (ctx->is_serv && errno == ENOTCONN)
+				return 0;
+			return -1;
+		}
+		ret = http3_write_data(ctx, httpconn, sockfd);
+		if (ret < 0)
+			return -1;
+	}
+	return 0;
+}
+
+static void http3_conn_free(nghttp3_conn *httpconn, int sockfd)
+{
+	close(sockfd);
+	nghttp3_conn_del(httpconn);
+}
+
+static int http3_server_recv_data(nghttp3_conn *conn, int64_t stream_id, const uint8_t *data,
+				  size_t datalen, void *user_data, void *stream_user_data)
+{
+	http_log_debug("%s: %llu\n", __func__, stream_id);
+	return 0;
+}
+
+static int http3_server_begin_headers(nghttp3_conn *conn, int64_t stream_id, void *user_data,
+				      void *stream_user_data)
+{
+	http_log_debug("%s: %llu\n", __func__, stream_id);
+	return 0;
+}
+
+static int http3_server_recv_header(nghttp3_conn *conn, int64_t stream_id, int32_t token,
+				    nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
+				    void *user_data, void *stream_user_data)
+{
+	nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+	struct http_ctx *ctx = user_data;
+	struct http_req *req;
+
+	req = &ctx->reqs[stream_id >> 2];
+	switch (token) {
+	case NGHTTP3_QPACK_TOKEN__PATH:
+		memcpy(req->path, v.base, v.len);
+		http_log_debug("%s: path %s\n", __func__, req->path);
+		break;
+	case NGHTTP3_QPACK_TOKEN__METHOD:
+		memcpy(req->method, v.base, v.len);
+		http_log_debug("%s: method %s\n", __func__, req->method);
+		break;
+	case NGHTTP3_QPACK_TOKEN__AUTHORITY:
+		memcpy(req->host, v.base, v.len);
+		http_log_debug("%s: host %s\n", __func__, req->host);
+		break;
+	}
+	return 0;
+}
+
+static nghttp3_ssize http3_content_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec,
+				        size_t veccnt, uint32_t *pflags, void *user_data,
+				        void *stream_user_data)
+{
+	struct http_ctx *ctx = user_data;
+	struct http_req *req;
+
+	req = &ctx->reqs[stream_id >> 2];
+	vec[0].base = req->data;
+	vec[0].len = req->len;
+
+	http_log_debug("%s: %lld %u\n", __func__, stream_id, vec[0].len);
+	*pflags |= NGHTTP3_DATA_FLAG_EOF;
+	return 1;
+}
+
+static int http3_server_end_stream(nghttp3_conn *conn, int64_t stream_id, void *user_data,
+				   void *stream_user_data)
+{
+	struct http_ctx *ctx = user_data;
+	char len[10], status[] = "200";
+	nghttp3_data_reader dr = {};
+	struct http_req *req;
+	char path[128] = {};
+	nghttp3_nv nva[4];
+	struct stat st;
+	int ret, fd;
+
+	req = &ctx->reqs[stream_id >> 2];
+	if (!strcmp(req->path, "/")) {
+		req->len = 14;
+		req->data = malloc(req->len);
+		if (!req->data)
+			return -1;
+		memcpy(req->data, "Hello, HTTP/3!", req->len);
+		goto send;
+	}
+
+	ret = sprintf(path, "%s%s", ctx->root, req->path);
+	if (ret < 0)
+		return -1;
+	http_log_debug("%s: %s\n", __func__, path);
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		req->len = 16;
+		strcpy(status, "404");
+		req->data = malloc(req->len);
+		if (!req->data)
+			return -1;
+		memcpy(req->data, "Sorry, Not Found", req->len);
+		goto send;
+	}
+	ret = fstat(fd, &st);
+	if (ret < 0)
+		return -1;
+	req->len = st.st_size;
+	req->data = malloc(req->len);
+	if (!req->data)
+		return -1;
+	ret = read(fd, req->data, req->len);
+	if (ret < 0)
+		goto err;
+	close(fd);
+
+send:
+	ret = sprintf(len, "%u", req->len);
+	if (ret < 0)
+		goto err;
+
+	http_log_debug("%s: %s, %lld\n", __func__, len, stream_id);
+
+	http3_make_nv(&nva[0], ":status", status);
+	http3_make_nv(&nva[1], "server", "nghttp3/quic server");
+	http3_make_nv(&nva[2], "content-type", "text/plain");
+	http3_make_nv(&nva[3], "content-length", len);
+
+	dr.read_data = http3_content_data;
+	return nghttp3_conn_submit_response(conn, stream_id, nva, 4, &dr);
+err:
+	free(req->data);
+	req->data = NULL;
+	return -1;
+}
+
+static int http3_server_create_conn(nghttp3_conn **httpconn, struct http_ctx *ctx)
+{
+	int64_t ctrl_stream_id, qpack_enc_stream_id, qpack_dec_stream_id;
+	const nghttp3_mem *mem = nghttp3_mem_default();
+	struct quic_transport_param param = {};
+	nghttp3_callbacks callbacks = {
+		http3_acked_stream_data,
+		http3_stream_close,
+		http3_server_recv_data,
+		http3_deferred_consume,
+		http3_server_begin_headers,
+		http3_server_recv_header,
+		http3_end_headers,
+		http3_begin_trailers,
+		http3_recv_trailer,
+		http3_end_trailers,
+		http3_stop_sending,
+		http3_server_end_stream,
+		http3_reset_stream,
+		http3_shutdown,
+		http3_recv_settings,
+	};
+	struct quic_stream_info sinfo;
+	socklen_t len = sizeof(sinfo);
+	nghttp3_settings settings;
+	int sockfd = ctx->sockfd;
+	unsigned int param_len;
+	int ret;
+
+	nghttp3_settings_default(&settings);
+	settings.qpack_blocked_streams = 100;
+	settings.qpack_max_dtable_capacity = 4096;
+
+	ret = nghttp3_conn_server_new(httpconn, &callbacks, &settings, mem, ctx);
+	if (ret) {
+		errno = -ret;
+		return -1;
+	}
+
+	param_len = sizeof(param);
+	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_TRANSPORT_PARAM, &param, &param_len);
+	if (ret == -1) {
+		http_log_error("socket getsockopt remote transport param\n");
+		return -1;
+	}
+	nghttp3_conn_set_max_client_streams_bidi(*httpconn, param.max_streams_bidi);
+
+	sinfo.stream_id = -1;
+	sinfo.stream_flags = MSG_STREAM_UNI;
+	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len);
+	if (ret) {
+		http_log_error("socket getsockopt stream_open ctrl failed\n");
+		return -1;
+	}
+	ctrl_stream_id = sinfo.stream_id;
+	ret = nghttp3_conn_bind_control_stream(*httpconn, ctrl_stream_id);
+	if (ret) {
+		errno = -ret;
+		return -1;
+	}
+	http_log_debug("%s ctrl_stream_id %llu\n", __func__, ctrl_stream_id);
+
+	sinfo.stream_id = -1;
+	sinfo.stream_flags = MSG_STREAM_UNI;
+	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len);
+	if (ret) {
+		http_log_error("socket getsockopt stream_open enc failed\n");
+		return -1;
+	}
+	qpack_enc_stream_id = sinfo.stream_id;
+	http_log_debug("%s qpack_enc_stream_id %llu\n", __func__, qpack_enc_stream_id);
+
+	sinfo.stream_id = -1;
+	sinfo.stream_flags = MSG_STREAM_UNI;
+	ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len);
+	if (ret) {
+		http_log_error("socket getsockopt stream_open dec failed\n");
+		return -1;
+	}
+	qpack_dec_stream_id = sinfo.stream_id;
+	http_log_debug("%s qpack_dec_stream_id %llu\n", __func__, qpack_dec_stream_id);
+	ret = nghttp3_conn_bind_qpack_streams(*httpconn, qpack_enc_stream_id,
+					      qpack_dec_stream_id);
+	if (ret) {
+		errno = -ret;
+		return -1;
+	}
+
+	return 0;
+}
+
+static int http3_client(char *urls, const char *root, int testcase)
+{
+	char *p, *url = strtok_r(urls, " ", &p);
+	struct quic_stream_info sinfo = {};
+	nghttp3_conn *httpconn = NULL;
+	int len = sizeof(sinfo);
+	struct http_ctx *ctx;
+	struct http_req *req;
+	int sockfd, ret = 0;
+	int64_t stream_id;
+
+	ctx = malloc(sizeof(*ctx));
+	if (!ctx)
+		return -ENOMEM;
+	memset(ctx, 0, sizeof(*ctx));
+
+	ret = http_parse_url(url, ctx);
+	if (ret) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	sockfd = http_client_setup_socket(ctx->host, ctx->port, testcase);
+	if (sockfd < 0) {
+		ret = -errno;
+		goto out;
+	}
+
+	if (http_client_handshake(sockfd, "h3", ctx->host, NULL, NULL, testcase)) {
+		ret = errno;
+		goto free;
+	}
+	http_log_debug("HANDSHAKE DONE\n");
+
+	if (testcase == IOP_KEYUPDATE) {
+		if (setsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_KEY_UPDATE, NULL, 0)) {
+			http_log_error("socket setsockopt key update failed\n");
+			ret = -errno;
+			goto free;
+		}
+	}
+
+	sinfo.stream_id = (99LL << 2); /* open enough streams for future use */
+	if (getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len)) {
+		http_log_error("socket getsockopt stream_open bidi failed\n");
+		ret = -errno;
+		goto free;
+	}
+
+	ctx->sockfd = sockfd;
+	if (http3_client_create_conn(&httpconn, ctx)) {
+		ret = -errno;
+		goto free;
+	}
+
+	strcpy(ctx->root, root);
+	while (url) {
+		stream_id = (ctx->req_cnt << 2);
+		if (http_parse_path(url, ctx, stream_id)) {
+			ret = -EINVAL;
+			goto free;
+		}
+
+		if (http3_submit_request(httpconn, ctx, stream_id)) {
+			ret = -errno;
+			goto free;
+		}
+
+		ctx->req_cnt++;
+		url = strtok_r(NULL, " ", &p);
+	}
+
+	if (http3_run_loop(httpconn, ctx))
+		ret = -errno;
+free:
+	http3_conn_free(httpconn, sockfd);
+out:
+	free(ctx);
+	return ret;
+}
+
+static int http3_server(char *host, const char *pkey_file, const char *cert_file,
+			const char *root, int testcase)
 {
 	nghttp3_conn *httpconn = NULL;
-	int ret, listenfd, sockfd;
-	struct http_request req;
+	int listenfd, sockfd, ret = 0;
+	struct http_ctx *ctx;
 	char *port;
 
-	host = strtok_r(host, ":", &port);
-	if (!host || !port)
-		return -1;
+	ctx = malloc(sizeof(*ctx));
+	if (!ctx)
+		return -ENOMEM;
+	memset(ctx, 0, sizeof(*ctx));
 
-	listenfd = http3_server_setup_socket(host, port);
-	if (listenfd < 0)
-		return -1;
+	port = strrchr(host, ':');
+	if (!port) {
+		ret = -EINVAL;
+		goto out;
+	}
+	*port++ = '\0';
 
+	listenfd = http_server_setup_socket(host, port, "h3", testcase);
+	if (listenfd < 0) {
+		ret = -errno;
+		goto out;
+	}
+
+	strcpy(ctx->root, root);
+	ctx->is_serv = 1;
 	while (1) {
-		sockfd = http3_server_accept_socket(listenfd, pkey_file, cert_file);
-		if (sockfd < 0)
+		sockfd = http_server_accept_socket(listenfd, pkey_file, cert_file, "h3", testcase);
+		if (sockfd < 0) {
+			ret = -errno;
 			break;
+		}
 
-		ret = http3_server_create_conn(&httpconn, sockfd, &req);
-		if (ret)
-			goto free;
+		ctx->sockfd = sockfd;
+		if (http3_server_create_conn(&httpconn, ctx)) {
+			http3_conn_free(httpconn, sockfd);
+			ret = -errno;
+			break;
+		}
 
-		http3_run_loop(httpconn, sockfd, &req);
-
-free:
+		if (http3_run_loop(httpconn, ctx)) {
+			http3_conn_free(httpconn, sockfd);
+			ret = -errno;
+			break;
+		}
 		http3_conn_free(httpconn, sockfd);
 	}
 
 	close(listenfd);
+out:
+	free(ctx);
+	return ret;
+}
+
+static long long http_get_time() {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    return (long long)(ts.tv_sec) * 1000 + (ts.tv_nsec) / 1000000;
+}
+
+/* http/0.9 functions */
+static int http09_submit_request(struct http_ctx *ctx, int64_t stream_id)
+{
+	struct http_req *req = &ctx->reqs[stream_id >> 2];
+	uint32_t flags = MSG_STREAM_FIN;
+	int ret, sockfd = ctx->sockfd;
+	char data[128] = {};
+
+	ret = sprintf(data, "GET %s%s", req->path, "\r\n");
+	if (ret < 0)
+		return -1;
+	http_log_debug("%s: %s\n", __func__, data);
+
+	ret = quic_sendmsg(sockfd, data, strlen(data), stream_id, flags);
+	if (ret < 0)
+		return -1;
 	return 0;
 }
 
-static void usage(void)
+static int http09_client_recv_data(struct http_ctx *ctx, int64_t stream_id, uint32_t flags,
+				   const uint8_t *data, size_t datalen)
 {
-	fprintf(stderr,
-"usage: interop_test -c url\n"
-"       interop_test -s -C certfile -P pkeyfile address:port\n"
-	);
-	exit(255);
+	struct http_req *req = &ctx->reqs[stream_id >> 2];
+	static size_t total;
+
+	if (!req->fd) {
+		char path[128] = {};
+		int ret;
+
+		ret = sprintf(path, "%s%s", ctx->root, req->path);
+		if (ret < 0)
+			return -1;
+		http_log_debug("%s: %s\n", __func__, path);
+
+		req->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (req->fd < 0) {
+			http_log_error("can not open file %s\n", path);
+			return -1;
+		}
+	}
+
+	if (write(req->fd, data, datalen) == -1) {
+		close(req->fd);
+		http_log_error("can not write file %s\n", req->path);
+		return -1;
+	}
+
+	if (flags & MSG_STREAM_FIN) {
+		ctx->req_cnt--;
+		if (!ctx->req_cnt)
+			ctx->complete = 1;
+
+		close(req->fd);
+	}
+
+	total += datalen;
+	http_log_debug("%s: %lu\n", __func__, total);
+	return 0;
+}
+
+static int http09_server_recv_data(struct http_ctx *ctx, int64_t stream_id, uint32_t flags,
+				   const uint8_t *data, size_t datalen)
+{
+	struct http_req *req = &ctx->reqs[stream_id >> 2];
+	int sockfd = ctx->sockfd;
+	char path[128] = {};
+	struct stat st;
+	int ret, fd;
+
+	if (datalen < 6) {
+		errno = EINVAL;
+		return -1;
+	}
+	datalen -= 6;
+
+	memcpy(req->path, &data[4], datalen);
+	req->path[datalen] = '\0';
+	http_log_debug("%s: %s\n", __func__, req->path);
+
+	if (!strcmp(req->path, "/")) {
+		req->len = 14;
+		req->data = malloc(req->len);
+		if (!req->data)
+			return -1;
+		memcpy(req->data, "Hello, HTTP/3!", req->len);
+		goto send;
+	}
+
+	ret = sprintf(path, "%s%s", ctx->root, req->path);
+	if (ret < 0)
+		return -1;
+	http_log_debug("%s: %s\n", __func__, path);
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		req->len = 16;
+		req->data = malloc(req->len);
+		if (!req->data)
+			return -1;
+		memcpy(req->data, "Sorry, Not Found", req->len);
+		goto send;
+	}
+	ret = fstat(fd, &st);
+	if (ret < 0) {
+		close(fd);
+		return -1;
+	}
+	req->len = st.st_size;
+	req->data = malloc(req->len);
+	if (!req->data) {
+		close(fd);
+		return -1;
+	}
+	ret = read(fd, req->data, req->len);
+	if (ret < 0) {
+		close(fd);
+		goto out;
+	}
+	close(fd);
+send:
+	ret = quic_sendmsg(sockfd, req->data, req->len, stream_id, MSG_STREAM_FIN);
+	if (ret > 0)
+		ret = 0;
+out:
+	free(req->data);
+	req->data = NULL;
+	return ret;
+}
+
+static int http09_run_loop(struct http_ctx *ctx)
+{
+	int sockfd = ctx->sockfd;
+	int64_t stream_id = -1;
+	uint32_t flags = 0;
+	struct timeval tv;
+	fd_set readfds;
+	int ret;
+
+	while (!ctx->complete) {
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		FD_ZERO(&readfds);
+		FD_SET(sockfd, &readfds);
+
+		ret = select(sockfd + 1, &readfds, NULL,  NULL, &tv);
+		if (ret < 0)
+			return -1;
+		while (1) {
+			flags = MSG_DONTWAIT;
+			ret = quic_recvmsg(sockfd, ctx->buf, sizeof(ctx->buf), &stream_id, &flags);
+			if (ret <= 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					break;
+				if (ctx->is_serv && errno == ENOTCONN)
+					return 0;
+				return -1;
+			}
+			if (ctx->is_serv)
+				ret = http09_server_recv_data(ctx, stream_id, flags, ctx->buf, ret);
+			else
+				ret = http09_client_recv_data(ctx, stream_id, flags, ctx->buf, ret);
+			if (ret)
+				return -1;
+			http_log_debug("%s: %d %ld %d\n", __func__, errno, stream_id, flags);
+		}
+	}
+	return 0;
+}
+
+static int http09_client(char *urls, const char *sess_file, const char *tp_file,
+			 const char *root, int testcase)
+{
+	char *p, *url = strtok_r(urls, " ", &p);
+	struct quic_stream_info sinfo = {};
+	struct quic_transport_param param;
+	int i, len = sizeof(sinfo);
+	unsigned int param_len;
+	struct http_ctx *ctx;
+	struct http_req *req;
+	int sockfd, ret = 0;
+	int64_t stream_id;
+	size_t buf_len;
+
+	ctx = malloc(sizeof(*ctx));
+	if (!ctx)
+		return -ENOMEM;
+	memset(ctx, 0, sizeof(*ctx));
+
+	ret = http_parse_url(url, ctx);
+	if (ret) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	sockfd = http_client_setup_socket(ctx->host, ctx->port, testcase);
+	if (sockfd < 0) {
+		ret = -errno;
+		goto out;
+	}
+
+	strcpy(ctx->root, root);
+	ctx->sockfd = sockfd;
+	if (testcase == IOP_ZERORTT) { /* load remote transport param */
+		if (http_read_file(tp_file, ctx->buf, &buf_len) < 0) {
+			ret = -errno;
+			goto free;
+		}
+		if (buf_len) {
+			param_len = sizeof(param);
+			if (param_len != buf_len) {
+				ret = -EINVAL;
+				goto free;
+			}
+			memcpy(&param, ctx->buf, param_len);
+			ret = setsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_TRANSPORT_PARAM,
+					 &param, param_len);
+			if (ret == -1) {
+				printf("socket setsockopt remote transport param\n");
+				ret = -errno;
+				goto free;
+			}
+
+			sinfo.stream_id = (99LL << 2); /* open enough streams for future use */
+			if (getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len)) {
+				http_log_error("socket getsockopt stream_open bidi failed\n");
+				ret = -errno;
+				goto free;
+			}
+
+			while (url) { /* send early data */
+				stream_id = (ctx->req_cnt << 2);
+				if (http_parse_path(url, ctx, stream_id)) {
+					ret = -EINVAL;
+					goto free;
+				}
+
+				if (http09_submit_request(ctx, stream_id)) {
+					ret = -errno;
+					goto free;
+				}
+
+				ctx->req_cnt++;
+				url = strtok_r(NULL, " ", &p);
+			}
+		}
+	}
+
+	if (http_client_handshake(sockfd, "hq-interop", ctx->host, ctx->buf, sess_file, testcase)) {
+		ret = -errno;
+		goto free;
+	}
+	http_log_debug("HANDSHAKE DONE\n");
+
+	if (testcase == IOP_ZERORTT) { /* save remote transport param */
+		param_len = sizeof(param);
+		param.remote = 1;
+		ret = getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_TRANSPORT_PARAM,
+				 &param, &param_len);
+		if (ret == -1) {
+			printf("socket getsockopt remote transport param\n");
+			ret = -errno;
+			goto free;
+		}
+		if (param_len) {
+			buf_len = param_len;
+			memcpy(ctx->buf, &param, buf_len);
+			if (http_write_file(tp_file, ctx->buf, buf_len) <= 0) {
+				ret = -errno;
+				goto free;
+			}
+		}
+	}
+
+	if (testcase == IOP_KEYUPDATE) {
+		if (setsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_KEY_UPDATE, NULL, 0)) {
+			http_log_error("socket setsockopt key update failed\n");
+			ret = -errno;
+			goto free;
+		}
+	}
+
+	sinfo.stream_id = (99LL << 2); /* open enough streams for future use */
+	if (testcase == IOP_MULTIPLEXING)
+		sinfo.stream_id = (2048LL << 2); /* for 2000 requests */
+	if (getsockopt(sockfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &sinfo, &len)) {
+		http_log_error("socket getsockopt stream_open bidi failed\n");
+		ret = -errno;
+		goto free;
+	}
+
+	while (url) {
+		stream_id = (ctx->req_cnt << 2);
+		if (http_parse_path(url, ctx, stream_id)) {
+			ret = -EINVAL;
+			goto free;
+		}
+
+		if (http09_submit_request(ctx, stream_id)) {
+			ret = -errno;
+			goto free;
+		}
+
+		ctx->req_cnt++;
+		url = strtok_r(NULL, " ", &p);
+	}
+
+	if (http09_run_loop(ctx))
+		ret = -errno;
+free:
+	close(sockfd);
+out:
+	free(ctx);
+	return ret;
+}
+
+static int http09_server(char *host, const char *pkey_file, const char *cert_file,
+			 const char *root, int testcase)
+{
+	int listenfd, sockfd, ret = 0;
+	struct http_ctx *ctx;
+	char *port;
+
+	ctx = malloc(sizeof(*ctx));
+	if (!ctx)
+		return -ENOMEM;
+	memset(ctx, 0, sizeof(*ctx));
+
+	port = strrchr(host, ':');
+	if (!port) {
+		ret = -EINVAL;
+		goto out;
+	}
+	*port++ = '\0';
+
+	listenfd = http_server_setup_socket(host, port, "hq-interop", testcase);
+	if (listenfd < 0) {
+		ctx->errcode = errno;
+		goto out;
+	}
+
+	strcpy(ctx->root, root);
+	ctx->is_serv = 1;
+	while (1) {
+		sockfd = http_server_accept_socket(listenfd, pkey_file, cert_file,
+						   "hq-interop", testcase);
+		if (sockfd < 0) {
+			ret = -errno;
+			break;
+		}
+		ctx->sockfd = sockfd;
+
+		if (http09_run_loop(ctx)) {
+			ret = -errno;
+			close(sockfd);
+			break;
+		}
+		close(sockfd);
+	}
+
+	close(listenfd);
+out:
+	free(ctx);
+	return ret;
+}
+
+static int http09_session_client(char *urls, const char *sess_file, const char *tp_file,
+				 const char *root, int testcase)
+{
+}
+
+/* iop functions */
+static int iop_get_testcase(void)
+{
+	char *testcase = getenv("TESTCASE");
+
+	if (!testcase)
+		return 0;
+	if(!strcmp(testcase, "chacha20"))
+		return IOP_CHACHA20;
+	if(!strcmp(testcase, "handshake"))
+		return IOP_HANDSHAKE;
+	if(!strcmp(testcase, "http3"))
+		return IOP_HTTP3;
+	if(!strcmp(testcase, "keyupdate"))
+		return IOP_KEYUPDATE;
+	if(!strcmp(testcase, "handshakeloss"))
+		return IOP_MULTICONNECT;
+	if(!strcmp(testcase, "resumption"))
+		return IOP_RESUMPTION;
+	if(!strcmp(testcase, "retry"))
+		return IOP_RETRY;
+	if(!strcmp(testcase, "transfer"))
+		return IOP_TRANSFER;
+	if (!strcmp(testcase, "versionnegotiation"))
+		return IOP_VERSIONNEGOTIATION;
+	if(!strcmp(testcase, "zerortt"))
+		return IOP_ZERORTT;
+	if(!strcmp(testcase, "v2"))
+		return IOP_V2;
+	if(!strcmp(testcase, "ipv6"))
+		return IOP_IPV6;
+	if(!strcmp(testcase, "goodput"))
+		return IOP_GOODPUT;
+	if(!strcmp(testcase, "ecn"))
+		return IOP_ECN;
+	if(!strcmp(testcase, "multiplexing"))
+		return IOP_MULTIPLEXING;
+	if(!strcmp(testcase, "transferloss"))
+		return IOP_TRANSFERLOSS;
+	if(!strcmp(testcase, "handshakecorruption"))
+		return IOP_HANDSHAKECORRUPTION;
+	if(!strcmp(testcase, "transfercorruption"))
+		return IOP_TRANSFERCORRUPTION;
+	if(!strcmp(testcase, "longrtt"))
+		return IOP_LONGRTT;
+	if(!strcmp(testcase, "blackhole"))
+		return IOP_BLACKHOLE;
+	if(!strcmp(testcase, "crosstraffic"))
+		return IOP_CROSSTRFFIC;
+	if(!strcmp(testcase, "amplificationlimit"))
+		return IOP_AMPLIFICATIONLIMIT;
+
+	return 0;
+}
+
+static void iop_print_usage(void)
+{
+	http_log_error("usage: interop_test -c -D rootdir -S sessfile -t tpfile url\n");
+	http_log_error("       interop_test -s -D rootdir -C certfile -P pkeyfile address:port\n");
 }
 
 int main(int argc, char *argv[])
 {
-	int ch, server = 0, client = 0, testcase = 0;
+	char *sessfile = "./session.bin", *tpfile = "./tp.bin", *root = "./";
+	int server = 0, client = 0, testcase = 0;
 	char *certfile = NULL, *pkeyfile = NULL;
+	int fd, ch;
 
-	while ((ch = getopt(argc, argv, "C:P:cs")) != -1) {
+	while ((ch = getopt(argc, argv, "C:P:S:T:D:cs")) != -1) {
 		switch (ch) {
 		case 'C':
 			certfile = optarg;
 			break;
 		case 'P':
 			pkeyfile = optarg;
+			break;
+		case 'S':
+			sessfile = optarg;
+			break;
+		case 'T':
+			tpfile = optarg;
+			break;
+		case 'D':
+			root = optarg;
 			break;
 		case 'c':
 			client = 1;
@@ -964,32 +1744,31 @@ int main(int argc, char *argv[])
 			server = 1;
 			break;
 		default:
-			usage();
+			iop_print_usage();
+			return 255;
 		}
 	}
 	argc -= optind;
 	argv += optind;
 
 	testcase = iop_get_testcase();
-	if (!testcase || (server && testcase == IOP_KEYUPDATE)) {
-		fprintf(stderr, "unsupported test case\n");
+	if (!testcase) {
+		http_log_error("unknown test case\n");
 		return 127;
 	}
 
-	if (argc != 1 || (!client && !server) || !testcase ||
-	    (client && (certfile || pkeyfile)) ||
-	    (server && (!certfile || !pkeyfile)))
-		usage();
+	if (argc != 1 || (!client && !server) || (server && (!certfile || !pkeyfile))) {
+		iop_print_usage();
+		return 255;
+	}
 
 	if (client) {
-		switch (testcase) {
-		case IOP_HTTP3:
-			return do_http3_client(argv[0]);
-		}
+		if (testcase == IOP_HTTP3)
+			return http3_client(argv[0], root, testcase);
+		return http09_client(argv[0], sessfile, tpfile, root, testcase);
 	}
 
-	switch (testcase) {
-	case IOP_HTTP3:
-		return do_http3_server(argv[0], pkeyfile, certfile);
-	}
+	if (testcase == IOP_HTTP3)
+		return http3_server(argv[0], pkeyfile, certfile, root, testcase);
+	return http09_server(argv[0], pkeyfile, certfile, root, testcase);
 }
