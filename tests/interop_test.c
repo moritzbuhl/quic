@@ -262,7 +262,7 @@ static int http_client_handshake(int sockfd, const char *alpns, const char *host
 	char alpn[64], *prio = QUIC_PRIORITY;
 	size_t buf_len, alpn_len;
 	gnutls_session_t session;
-	int ret;
+	int ret, count = 0;
 
 	ret = gnutls_certificate_allocate_credentials(&cred);
 	if (ret)
@@ -320,16 +320,21 @@ static int http_client_handshake(int sockfd, const char *alpns, const char *host
 	}
 
 	if (testcase == IOP_RESUMPTION || testcase == IOP_ZERORTT) { /* save session ticket */
-		sleep(1);
-		buf_len = 4096;
-		ret = quic_session_get_data(session, buf, &buf_len);
-		if (ret)
-			goto err_session;
-		if (buf_len) {
-			if (http_write_file(sess_file, buf, buf_len) <= 0) {
-				ret = -errno;
-				goto err_session;
+		while (1) {
+			buf_len = 4096;
+			ret = quic_session_get_data(session, buf, &buf_len);
+			if (ret)
+				break;
+			if (buf_len) {
+				if (http_write_file(sess_file, buf, buf_len) <= 0)
+					ret = -errno;
+				break;
 			}
+			if (count++ == 3) { /* wait for session ticket up to 3 secs */
+				ret = -EINVAL;
+				break;
+			}
+			sleep(1);
 		}
 	}
 
