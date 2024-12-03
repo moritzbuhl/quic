@@ -114,9 +114,26 @@ struct quic6_sock {
 	struct ipv6_pinfo	inet6;
 };
 
+struct quic_stream_sock {
+	struct quic_sock	sk;
+	struct quic_sock	*quic_sk;
+	struct quic_stream	*stream
+};
+
+struct quic6_stream_sock {
+	struct quic6_sock	sk;
+	struct quic6_sock	*quic_sk;
+	struct quic_stream	*stream
+};
+
 static inline struct quic_sock *quic_sk(const struct sock *sk)
 {
 	return (struct quic_sock *)sk;
+}
+
+static inline struct quic_stream_sock *quic_stream_sk(const struct sock *sk)
+{
+	return (struct quic_stream_sock *)sk;
 }
 
 static inline void quic_set_af_ops(struct sock *sk, struct quic_addr_family_ops *af_ops)

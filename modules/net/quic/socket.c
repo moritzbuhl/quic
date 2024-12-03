@@ -655,20 +655,30 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 
 	lock_sock(sk);
 	err = quic_msghdr_parse(sk, msg, &hinfo, &sinfo, &has_hinfo);
-	if (err)
-		goto err;
+	if (err) {
+		release_sock(sk);
+		return err;
+	}
+
+	return quic_sendit(sk, msg, msg_len, &hinfo, &sinfo, has_hinfo);
+}
+
+static int quic_sendit(struct sock *sk, struct msghdr *msg, size_t msg_len,
+		       struct quic_handshake_info *hinfo,
+		       struct quic_stream_info *sinfo, bool has_hinfo)
+{
 
 	if (has_hinfo) {
-		if (hinfo.crypto_level >= QUIC_CRYPTO_EARLY) {
+		if (hinfo->crypto_level >= QUIC_CRYPTO_EARLY) {
 			err = -EINVAL;
 			goto err;
 		}
-		crypto = quic_crypto(sk, hinfo.crypto_level);
+		crypto = quic_crypto(sk, hinfo->crypto_level);
 		if (!quic_crypto_send_ready(crypto)) {
 			err = -EINVAL;
 			goto err;
 		}
-		msginfo.level = hinfo.crypto_level;
+		msginfo.level = hinfo->crypto_level;
 		msginfo.msg = &msg->msg_iter;
 		while (iov_iter_count(&msg->msg_iter) > 0) {
 			frame = quic_frame_create(sk, QUIC_FRAME_CRYPTO, &msginfo);
@@ -723,7 +733,7 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 		goto out;
 	}
 
-	stream = quic_sock_send_stream(sk, &sinfo);
+	stream = quic_sock_send_stream(sk, sinfo);
 	if (IS_ERR(stream)) {
 		err = PTR_ERR(stream);
 		goto err;
@@ -731,7 +741,7 @@ static int quic_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
 
 	msginfo.stream = stream;
 	msginfo.msg = &msg->msg_iter;
-	msginfo.flags = sinfo.stream_flags;
+	msginfo.flags = sinfo->stream_flags;
 
 	while (iov_iter_count(msginfo.msg) > 0) {
 		frame = quic_frame_create(sk, QUIC_FRAME_STREAM, &msginfo);
@@ -1093,14 +1103,16 @@ static int quic_copy_sock(struct sock *nsk, struct sock *sk, struct quic_request
 
 	inet_sk(nsk)->pmtudisc = inet_sk(sk)->pmtudisc;
 
-	skb_queue_walk_safe(quic_inq_backlog_list(inq), skb, tmp) {
-		quic_get_msg_addr(nsk, &da, skb, 0);
-		quic_get_msg_addr(nsk, &sa, skb, 1);
+	if (req) {
+		skb_queue_walk_safe(quic_inq_backlog_list(inq), skb, tmp) {
+			quic_get_msg_addr(nsk, &da, skb, 0);
+			quic_get_msg_addr(nsk, &sa, skb, 1);
 
-		if (!memcmp(&req->sa, &da, quic_addr_len(nsk)) &&
-		    !memcmp(&req->da, &sa, quic_addr_len(nsk))) {
-			__skb_unlink(skb, quic_inq_backlog_list(inq));
-			quic_inq_backlog_tail(nsk, skb);
+			if (!memcmp(&req->sa, &da, quic_addr_len(nsk)) &&
+			    !memcmp(&req->da, &sa, quic_addr_len(nsk))) {
+				__skb_unlink(skb, quic_inq_backlog_list(inq));
+				quic_inq_backlog_tail(nsk, skb);
+			}
 		}
 	}
 
@@ -2261,4 +2273,82 @@ struct proto quicv6_prot = {
 	.enter_memory_pressure	=  quic_enter_memory_pressure,
 	.memory_allocated	=  &quic_memory_allocated,
 	.sockets_allocated	=  &quic_sockets_allocated,
+};
+
+static int quic_stream_sendmsg(struct sock *sk, struct msghdr *msg, size_t msg_len)
+{
+	struct quic_stream_sock *qssk = quic_stream_sk(sk);
+	struct quic_handshake_info hinfo = {};
+	struct quic_stream_info sinfo = {};
+	bool has_hinfo = false;
+	lock_sock(sk);
+
+	err = quic_msghdr_parse(sk, msg, &hinfo, &sinfo, &has_hinfo);
+	release_sock(sk);
+	if (err)
+		return err;
+	sinfo.stream_id = qssk->stream->id;
+
+	lock_sock(qssk->quic);
+	return quic_sendit(qssk->quic, msg, msg_len, &hinfo, &sinfo, has_hinfo);
+}
+
+static struct sock *quic_stream_sock_create(struct sock *sk)
+{
+	struct sock *nsk = NULL;
+	int err = -EINVAL;
+	long timeo;
+
+	lock_sock(sk);
+
+	nsk = sk_alloc(sock_net(sk), quic_af_ops(sk)->sa_family, GFP_KERNEL,
+		       sk->sk_prot, kern);
+	if (!nsk) {
+		err = -ENOMEM;
+		goto out;
+	}
+	sock_init_data(NULL, nsk);
+
+	quic_outq_set_serv(quic_outq(nsk));
+
+	err = nsk->sk_prot->init(nsk);
+	if (err)
+		goto free;
+
+	err = quic_copy_sock(nsk, sk, NULL);
+	if (err)
+		goto free;
+	// XXX
+	err = nsk->sk_prot->bind(nsk, &req->sa.sa, (int)quic_addr_len(nsk));
+	if (err)
+		goto free;
+
+	// XXX
+	err = quic_accept_sock_init(nsk, req);
+	if (err)
+		goto free;
+out:
+	release_sock(sk);
+	*errp = err;
+	return nsk;
+free:
+	nsk->sk_prot->close(nsk, 0);
+	nsk = NULL;
+	goto out;
+}
+
+struct proto quic_prot = {
+	.name		=  "QUIC STREAM",
+	.owner		=  THIS_MODULE,
+	.sendmsg	=  quic_stream_sendmsg,
+	.recvmsg	=  quic_recvmsg,
+	.obj_size	=  sizeof(struct quic_stream_sock),
+};
+
+struct proto quicv6_prot = {
+	.name		=  "QUICv6 STREAM",
+	.owner		=  THIS_MODULE,
+	.sendmsg	=  quic_stream_sendmsg,
+	.recvmsg	=  quic_recvmsg,
+	.obj_size	= sizeof(struct quic6_stream_sock),
 };

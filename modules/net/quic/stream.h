@@ -50,6 +50,7 @@ struct quic_stream {
 		u8 state;
 		u8 done:1;
 	} recv;
+	struct quic_stream_sock *sock;
 };
 
 struct quic_stream_table {
