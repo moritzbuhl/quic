@@ -50,6 +50,13 @@ jobs:
         run: |
           cd quic-interop-runner
           pip3 install -r requirements.txt
+          echo '                res = ""' | tee ./result
+          echo '                trs = TestResult.SUCCEEDED' | tee -a ./result
+          echo '                greens = [test.abbreviation() for test in cell if cell[test] is trs]' | tee -a ./result
+          echo '                greens = [greens[i:i + 8] for i in range(0, len(greens), 8)]' | tee -a ./result
+          echo '                for green in greens:' | tee -a ./result
+          echo '                    res += colored(trs.symbol() + "(" + ",".join(green), "green") + ")" + br' | tee -a ./result
+          sed -i '/res = colored(get_letters(TestResult.SUCCEEDED), "green") + br/{r ./result'$'\n''d;}' interop.py
           cd ../
 
       - name: Run tests
