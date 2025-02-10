@@ -434,6 +434,7 @@ static struct quic_frame *quic_frame_retire_conn_id_create(struct sock *sk, void
 static struct quic_frame *quic_frame_new_conn_id_create(struct sock *sk, void *data, u8 type)
 {
 	struct quic_crypto *crypto = quic_crypto(sk, QUIC_CRYPTO_INITIAL);
+	struct quic_conn_id_set *id_set = quic_source(sk);
 	struct quic_conn_id scid = {};
 	u8 *p, buf[100], token[16];
 	u64 *prior = data, seqno;
@@ -441,7 +442,7 @@ static struct quic_frame *quic_frame_new_conn_id_create(struct sock *sk, void *d
 	u32 frame_len;
 	int err;
 
-	seqno = quic_conn_id_last_number(quic_source(sk)) + 1;
+	seqno = quic_conn_id_last_number(id_set) + 1;
 
 	p = quic_put_var(buf, type);
 	p = quic_put_var(p, seqno);
@@ -459,7 +460,7 @@ static struct quic_frame *quic_frame_new_conn_id_create(struct sock *sk, void *d
 		return NULL;
 	quic_put_data(frame->data, buf, frame_len);
 
-	err = quic_conn_id_add(quic_source(sk), &scid, seqno, sk);
+	err = quic_conn_id_add(id_set, &scid, seqno, sk);
 	if (err) {
 		quic_frame_put(frame);
 		return NULL;
@@ -932,9 +933,9 @@ static int quic_frame_new_conn_id_process(struct sock *sk, struct quic_frame *fr
 	if (err)
 		return err;
 
-	for (; first < prior; first++) {
-		if (quic_outq_transmit_frame(sk, QUIC_FRAME_RETIRE_CONNECTION_ID, &first,
-					     frame->path_alt, true))
+	if (prior > first) {
+		prior--;
+		if (quic_outq_transmit_retire_conn_id(sk, prior, frame->path_alt, true))
 			return -ENOMEM;
 	}
 
@@ -956,28 +957,25 @@ static int quic_frame_retire_conn_id_process(struct sock *sk, struct quic_frame 
 
 	if (!quic_get_var(&p, &len, &seqno))
 		return -EINVAL;
+
 	first = quic_conn_id_first_number(id_set);
-	if (seqno < first) /* dup */
-		goto out;
 	last  = quic_conn_id_last_number(id_set);
-	if (seqno != first || seqno == last) {
-		frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
-		return -EINVAL;
+	if (seqno >= first) {
+		if (seqno >= last) {
+			frame->errcode = QUIC_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+			return -EINVAL;
+		}
+
+		quic_conn_id_remove(id_set, seqno);
+		first = quic_conn_id_first_number(id_set);
+		info.prior_to = first;
+		active = quic_conn_id_active(id_set);
+		info.active = quic_conn_id_number(active);
+		quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_ID, &info);
 	}
 
-	quic_conn_id_remove(id_set, seqno);
-	info.prior_to =  quic_conn_id_first_number(id_set);
-	active = quic_conn_id_active(id_set);
-	info.active = quic_conn_id_number(active);
-	quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_ID, &info);
-
-	if (last - seqno >= quic_conn_id_max_count(id_set))
-		goto out;
-	seqno++;
-	if (quic_outq_transmit_frame(sk, QUIC_FRAME_NEW_CONNECTION_ID, &seqno,
-				     frame->path_alt, true))
+	if (quic_outq_transmit_new_conn_id(sk, first, frame->path_alt, true))
 		return -ENOMEM;
-out:
 	return (int)(frame->len - len);
 }
 

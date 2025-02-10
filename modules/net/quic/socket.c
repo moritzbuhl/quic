@@ -1403,19 +1403,15 @@ static int quic_sock_set_transport_params_ext(struct sock *sk, u8 *p, u32 len)
 
 static int quic_sock_set_crypto_secret(struct sock *sk, struct quic_crypto_secret *secret, u32 len)
 {
-	struct quic_conn_id_set *id_set = quic_source(sk);
 	struct quic_packet *packet = quic_packet(sk);
 	struct quic_path_addr *path = quic_src(sk);
 	struct quic_outqueue *outq = quic_outq(sk);
 	struct quic_inqueue *inq = quic_inq(sk);
 	struct quic_config *c = quic_config(sk);
-	struct quic_frame *frame, *tmp;
-	struct list_head list, *head;
+	struct quic_cong *cong = quic_cong(sk);
 	struct quic_crypto *crypto;
 	struct sk_buff_head tmpq;
 	struct sk_buff *skb;
-	u64 prior = 0;
-	u32 seqno;
 	int err;
 
 	if (len != sizeof(*secret))
@@ -1432,30 +1428,10 @@ static int quic_sock_set_crypto_secret(struct sock *sk, struct quic_crypto_secre
 		return err;
 
 	if (secret->level != QUIC_CRYPTO_APP) {
-		if (!secret->send) { /* 0rtt or handshake recv key is ready */
-			__skb_queue_head_init(&tmpq);
-			skb_queue_splice_init(quic_inq_backlog_list(inq), &tmpq);
-			skb = __skb_dequeue(&tmpq);
-			while (skb) {
-				quic_packet_process(sk, skb);
-				skb = __skb_dequeue(&tmpq);
-			}
+		if (secret->send) { /* 0rtt or handshake send key is ready */
+			if (secret->level == QUIC_CRYPTO_EARLY) /* 0rtt recv key is ready */
+				quic_outq_set_data_level(outq, QUIC_CRYPTO_EARLY);
 			return 0;
-		}
-		/* 0rtt send key is ready */
-		if (secret->level == QUIC_CRYPTO_EARLY)
-			quic_outq_set_data_level(outq, QUIC_CRYPTO_EARLY);
-		return 0;
-	}
-
-	INIT_LIST_HEAD(&list);
-	if (!secret->send) { /* app recv key is ready */
-		quic_data_free(quic_ticket(sk)); /* clean it to receive new session ticket msg */
-		quic_data_free(quic_token(sk)); /* clean it to receive new token */
-		head = quic_inq_early_list(inq);
-		if (!list_empty(head)) {
-			list_splice_init(head, quic_inq_recv_list(inq));
-			sk->sk_data_ready(sk);
 		}
 		__skb_queue_head_init(&tmpq);
 		skb_queue_splice_init(quic_inq_backlog_list(inq), &tmpq);
@@ -1464,68 +1440,61 @@ static int quic_sock_set_crypto_secret(struct sock *sk, struct quic_crypto_secre
 			quic_packet_process(sk, skb);
 			skb = __skb_dequeue(&tmpq);
 		}
-		if (quic_is_serv(sk)) {
-			/* some implementations don't send ACKs to handshake packets
-			 * so ACK them manually.
-			 */
-			quic_outq_transmitted_sack(sk, QUIC_CRYPTO_INITIAL,
-						   QUIC_PN_MAP_MAX_PN, 0, -1, 0);
-			quic_outq_transmitted_sack(sk, QUIC_CRYPTO_HANDSHAKE,
-						   QUIC_PN_MAP_MAX_PN, 0, -1, 0);
-			if (quic_path_pref_addr(path)) {
-				err = quic_path_set_bind_port(sk, path, 1);
-				if (err)
-					return err;
-				err = quic_path_set_udp_sock(sk, path, 1);
-				if (err)
-					return err;
-			}
-			frame = quic_frame_create(sk, QUIC_FRAME_NEW_TOKEN, NULL);
-			if (!frame)
-				return -ENOMEM;
-			list_add_tail(&frame->list, &list);
-			frame = quic_frame_create(sk, QUIC_FRAME_HANDSHAKE_DONE, NULL);
-			if (!frame) {
-				quic_frame_list_purge(&list);
-				return -ENOMEM;
-			}
-			list_add_tail(&frame->list, &list);
-			list_for_each_entry_safe(frame, tmp, &list, list) {
-				list_del(&frame->list);
-				quic_outq_ctrl_tail(sk, frame, true);
-			}
-			quic_outq_transmit(sk);
-		}
+		return 0;
+	}
 
-		/* enter established only when both send and recv keys are ready */
-		if (quic_crypto_send_ready(crypto)) {
+	if (secret->send) { /* app send key is ready */
+		quic_outq_set_data_level(outq, QUIC_CRYPTO_APP);
+		if (quic_outq_transmit_new_conn_id(sk, 0, 0, true))
+			return -ENOMEM;
+		if (quic_crypto_recv_ready(crypto)) {
 			quic_set_state(sk, QUIC_SS_ESTABLISHED);
-			quic_timer_reset(sk, QUIC_TIMER_PATH, c->plpmtud_probe_interval);
+			quic_timer_start(sk, QUIC_TIMER_PMTU, c->plpmtud_probe_interval);
+			quic_timer_start(sk, QUIC_TIMER_PATH, (u64)quic_cong_pto(cong) * 3);
 		}
 		return 0;
 	}
 
-	/* app send key is ready */
-	quic_outq_set_data_level(outq, QUIC_CRYPTO_APP);
-	seqno = quic_conn_id_last_number(id_set) + 1;
-	for (; seqno <= quic_conn_id_max_count(id_set) + prior - 1; seqno++) {
-		frame = quic_frame_create(sk, QUIC_FRAME_NEW_CONNECTION_ID, &prior);
-		if (!frame) {
-			while (seqno)
-				quic_conn_id_remove(quic_source(sk), seqno--);
-			quic_frame_list_purge(&list);
-			return -ENOMEM;
-		}
-		list_add_tail(&frame->list, &list);
+	/* app recv key is ready */
+	quic_data_free(quic_ticket(sk)); /* clean it to receive new session ticket msg */
+	quic_data_free(quic_token(sk)); /* clean it to receive new token */
+	if (!list_empty(quic_inq_early_list(inq))) {
+		list_splice_init(quic_inq_early_list(inq), quic_inq_recv_list(inq));
+		sk->sk_data_ready(sk);
 	}
-	list_for_each_entry_safe(frame, tmp, &list, list) {
-		list_del(&frame->list);
-		quic_outq_ctrl_tail(sk, frame, true);
+	__skb_queue_head_init(&tmpq);
+	skb_queue_splice_init(quic_inq_backlog_list(inq), &tmpq);
+	skb = __skb_dequeue(&tmpq);
+	while (skb) {
+		quic_packet_process(sk, skb);
+		skb = __skb_dequeue(&tmpq);
+	}
+	if (quic_is_serv(sk)) {
+		/* some implementations don't send ACKs to handshake packets so ACK them manually */
+		quic_outq_transmitted_sack(sk, QUIC_CRYPTO_INITIAL, QUIC_PN_MAP_MAX_PN, 0, -1, 0);
+		quic_outq_transmitted_sack(sk, QUIC_CRYPTO_HANDSHAKE, QUIC_PN_MAP_MAX_PN, 0, -1, 0);
+
+		if (quic_path_pref_addr(path)) {
+			err = quic_path_set_bind_port(sk, path, 1);
+			if (err)
+				return err;
+			err = quic_path_set_udp_sock(sk, path, 1);
+			if (err)
+				return err;
+		}
+
+		if (quic_outq_transmit_frame(sk, QUIC_FRAME_NEW_TOKEN, NULL, 0, true))
+			return -ENOMEM;
+		if (quic_outq_transmit_frame(sk, QUIC_FRAME_HANDSHAKE_DONE, NULL, 0, true))
+			return -ENOMEM;
+		quic_outq_transmit(sk);
 	}
 
-	if (quic_crypto_recv_ready(crypto)) {
+	/* enter established only when both send and recv keys are ready */
+	if (quic_crypto_send_ready(crypto)) {
 		quic_set_state(sk, QUIC_SS_ESTABLISHED);
-		quic_timer_reset(sk, QUIC_TIMER_PATH, c->plpmtud_probe_interval);
+		quic_timer_start(sk, QUIC_TIMER_PMTU, c->plpmtud_probe_interval);
+		quic_timer_start(sk, QUIC_TIMER_PATH, (u64)quic_cong_pto(cong) * 3);
 	}
 	return 0;
 }
@@ -1535,9 +1504,7 @@ static int quic_sock_set_connection_id(struct sock *sk,
 {
 	struct quic_conn_id_set *id_set = quic_source(sk);
 	struct quic_conn_id *active, *old;
-	struct quic_frame *frame, *tmp;
 	u64 number, first, last;
-	struct list_head list;
 
 	if (len < sizeof(*info) || !quic_is_established(sk))
 		return -EINVAL;
@@ -1570,29 +1537,18 @@ static int quic_sock_set_connection_id(struct sock *sk,
 	}
 
 	if (!info->dest) {
-		if (quic_outq_transmit_frame(sk, QUIC_FRAME_NEW_CONNECTION_ID, &number, 0, false)) {
+		if (quic_outq_transmit_new_conn_id(sk, number, 0, false)) {
 			quic_conn_id_set_active(id_set, old);
 			return -ENOMEM;
 		}
 		return 0;
 	}
 
-	INIT_LIST_HEAD(&list);
-	for (; first < number; first++) {
-		frame = quic_frame_create(sk, QUIC_FRAME_RETIRE_CONNECTION_ID, &first);
-		if (!frame) {
-			quic_conn_id_set_active(id_set, old);
-			quic_frame_list_purge(&list);
-			return -ENOMEM;
-		}
-		list_add_tail(&frame->list, &list);
+	number--;
+	if (quic_outq_transmit_retire_conn_id(sk, number, 0, false)) {
+		quic_conn_id_set_active(id_set, old);
+		return -ENOMEM;
 	}
-
-	list_for_each_entry_safe(frame, tmp, &list, list) {
-		list_del(&frame->list);
-		quic_outq_ctrl_tail(sk, frame, true);
-	}
-	quic_outq_transmit(sk);
 
 	return 0;
 }
@@ -2113,6 +2069,10 @@ static void quic_release_cb(struct sock *sk)
 	}
 	if (flags & QUIC_F_PATH_DEFERRED) {
 		quic_timer_path_handler(sk);
+		__sock_put(sk);
+	}
+	if (flags & QUIC_F_PMTU_DEFERRED) {
+		quic_timer_pmtu_handler(sk);
 		__sock_put(sk);
 	}
 	if (flags & QUIC_F_TSQ_DEFERRED) {

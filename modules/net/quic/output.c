@@ -64,20 +64,9 @@ static void quic_outq_transmit_ctrl(struct sock *sk, u8 level)
 		return;
 
 	if (quic_pnspace_need_sack(space)) {
-		frame = quic_frame_create(sk, QUIC_FRAME_ACK, &level);
-		while (frame) {
-			frame->path_alt = quic_pnspace_path_alt(space);
-			if (quic_packet_config(sk, frame->level, frame->path_alt) ||
-			    quic_outq_limit_check(sk, frame->type, frame->len)) {
-				quic_frame_put(frame);
-				return;
-			}
-			if (quic_packet_tail(sk, frame)) {
-				quic_pnspace_set_need_sack(space, 0);
-				break;
-			}
-			outq->count += quic_packet_create(sk);
-		};
+		if (!quic_outq_transmit_frame(sk, QUIC_FRAME_ACK, &level,
+					      quic_pnspace_path_alt(space), true))
+			quic_pnspace_set_need_sack(space, 0);
 	}
 
 	head = &outq->control_list;
@@ -353,8 +342,8 @@ void quic_outq_ctrl_tail(struct sock *sk, struct quic_frame *frame, bool cork)
 	struct list_head *head = &quic_outq(sk)->control_list;
 	struct quic_frame *pos;
 
-	if (frame->level) { /* prioritize handshake frames */
-		list_for_each_entry(pos, head, list) {
+	list_for_each_entry(pos, head, list) {
+		if (frame->level) {
 			if (!pos->level) {
 				head = &pos->list;
 				break;
@@ -366,7 +355,14 @@ void quic_outq_ctrl_tail(struct sock *sk, struct quic_frame *frame, bool cork)
 				break;
 			}
 		}
+		if (quic_frame_path_probing(frame->type)) {
+			head = &pos->list;
+			break;
+		}
+		if (!frame->level)
+			break;
 	}
+
 	quic_outq_set_owner_w((int)frame->bytes, sk);
 	list_add_tail(&frame->list, head);
 	if (!cork)
@@ -444,14 +440,14 @@ void quic_outq_transmit_probe(struct sock *sk)
 
 	info.size = quic_path_probe_size(path);
 	info.level = QUIC_CRYPTO_APP;
+	number = quic_pnspace_next_pn(space);
 	if (!quic_outq_transmit_frame(sk, QUIC_FRAME_PING, &info, 0, false)) {
-		number = quic_pnspace_next_pn(space);
 		pathmtu = quic_path_pl_send(path, number);
 		if (pathmtu)
 			quic_packet_mss_update(sk, pathmtu + taglen);
 	}
 
-	quic_timer_reset(sk, QUIC_TIMER_PATH, c->plpmtud_probe_interval);
+	quic_timer_reset(sk, QUIC_TIMER_PMTU, c->plpmtud_probe_interval);
 }
 
 void quic_outq_transmit_close(struct sock *sk, u8 type, u32 errcode, u8 level)
@@ -567,7 +563,7 @@ static void quic_outq_path_confirm(struct sock *sk, u8 level, s64 largest, s64 s
 	if (!complete)
 		quic_outq_transmit_probe(sk);
 	if (raise_timer) /* reuse probe timer as raise timer */
-		quic_timer_reset(sk, QUIC_TIMER_PATH, (u64)c->plpmtud_probe_interval * 30);
+		quic_timer_reset(sk, QUIC_TIMER_PMTU, (u64)c->plpmtud_probe_interval * 30);
 }
 
 void quic_outq_transmitted_sack(struct sock *sk, u8 level, s64 largest, s64 smallest,
@@ -905,8 +901,9 @@ out:
 	quic_outq_update_loss_timer(sk);
 }
 
-void quic_outq_free_path(struct sock *sk)
+void quic_outq_free_path(struct sock *sk, struct quic_conn_id *conn_id)
 {
+	struct quic_conn_id_set *dest = quic_dest(sk), *source = quic_source(sk);
 	struct quic_outqueue *outq = quic_outq(sk);
 
 	if (!outq->path_alt || !outq->path_swap)
@@ -919,7 +916,8 @@ void quic_outq_free_path(struct sock *sk)
 
 	outq->path_alt = 0;
 	outq->path_swap = 0;
-	quic_conn_id_clear_alt(quic_dest(sk));
+	quic_conn_id_set_alt(dest, NULL);
+	quic_conn_id_set_active(source, conn_id);
 }
 
 int quic_outq_probe_path(struct sock *sk, u8 path_alt, u8 cork)
@@ -941,7 +939,7 @@ int quic_outq_probe_path(struct sock *sk, u8 path_alt, u8 cork)
 			return -EINVAL;
 	}
 
-	if (!quic_conn_id_select_alt(dest)) {
+	if (!quic_conn_id_select_alt(dest, false)) {
 		if (outq->path_new_connid)
 			return -EINVAL;
 
@@ -976,12 +974,12 @@ int quic_outq_probe_path(struct sock *sk, u8 path_alt, u8 cork)
 		}
 	}
 
-	quic_set_sk_ecn(sk, 0); /* clear ecn during path migration */
-	quic_outq_transmit_frame(sk, QUIC_FRAME_PATH_CHALLENGE, NULL, path_alt, cork);
-
 	outq->path_sent_cnt = 1;
 	outq->path_alt = path_alt;
 	outq->path_new_connid = 0;
+
+	quic_set_sk_ecn(sk, 0); /* clear ecn during path migration */
+	quic_outq_transmit_frame(sk, QUIC_FRAME_PATH_CHALLENGE, NULL, path_alt, cork);
 	quic_timer_reset(sk, QUIC_TIMER_PATH, (u64)quic_cong_pto(quic_cong(sk)) * 3);
 	return 0;
 }
@@ -991,7 +989,6 @@ int quic_outq_change_path(struct sock *sk, u8 path_alt, u8 *entropy)
 	struct quic_path_addr *d = quic_dst(sk), *s = quic_src(sk);
 	struct quic_conn_id_set *id_set = quic_dest(sk);
 	struct quic_outqueue *outq = quic_outq(sk);
-	struct quic_config *c = quic_config(sk);
 	struct quic_frame *pos;
 	u8 local;
 
@@ -1008,7 +1005,6 @@ int quic_outq_change_path(struct sock *sk, u8 path_alt, u8 *entropy)
 
 	if (path_alt & QUIC_PATH_ALT_DST) {
 		local = 0;
-		quic_path_pl_reset(d);
 		quic_path_swap_active(d);
 		quic_set_sk_addr(sk, quic_path_addr(d, 0), 0);
 		quic_inq_event_recv(sk, QUIC_EVENT_CONNECTION_MIGRATION, &local);
@@ -1020,11 +1016,10 @@ int quic_outq_change_path(struct sock *sk, u8 path_alt, u8 *entropy)
 	list_for_each_entry(pos, &outq->transmitted_list, list)
 		pos->path_alt &= ~path_alt;
 
+	__sk_dst_reset(sk);
 	outq->path_swap = 1;
 	outq->path_sent_cnt = 0;
 	quic_conn_id_swap_active(id_set);
-	quic_timer_stop(sk, QUIC_TIMER_PATH);
-	quic_timer_reset(sk, QUIC_TIMER_PATH, c->plpmtud_probe_interval);
 	return 0;
 }
 
@@ -1065,6 +1060,37 @@ int quic_outq_transmit_frame(struct sock *sk, u8 type, void *data, u8 path_alt, 
 
 	frame->path_alt = path_alt;
 	quic_outq_ctrl_tail(sk, frame, cork);
+	return 0;
+}
+
+int quic_outq_transmit_new_conn_id(struct sock *sk, u64 prior, u8 path_alt, u8 cork)
+{
+	struct quic_conn_id_set *id_set = quic_source(sk);
+	u32 max, seqno;
+
+	max = quic_conn_id_max_count(id_set) + prior - 1;
+	for (seqno = quic_conn_id_last_number(id_set) + 1; seqno <= max; seqno++) {
+		if (quic_outq_transmit_frame(sk, QUIC_FRAME_NEW_CONNECTION_ID, &prior,
+					     path_alt, true))
+			return -ENOMEM;
+	}
+	if (!cork)
+		quic_outq_transmit(sk);
+	return 0;
+}
+
+int quic_outq_transmit_retire_conn_id(struct sock *sk, u64 prior, u8 path_alt, u8 cork)
+{
+	struct quic_conn_id_set *id_set = quic_dest(sk);
+	u64 seqno;
+
+	for (seqno = quic_conn_id_first_number(id_set); seqno <= prior; seqno++) {
+		if (quic_outq_transmit_frame(sk, QUIC_FRAME_RETIRE_CONNECTION_ID, &seqno,
+					     path_alt, cork))
+			return -ENOMEM;
+	}
+	if (!cork)
+		quic_outq_transmit(sk);
 	return 0;
 }
 
